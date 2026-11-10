@@ -298,3 +298,36 @@ def test_threshold_still_065():
     assert settings.confidence_threshold == 0.65
     assert agents_mod.ABSTAIN_CONFIDENCE == 0.65
     assert agents_mod.PROMPT_VERSION == "v2"  # prompt changed, version bumped
+
+
+@pytest.mark.asyncio
+async def test_live_llm_explicit_abstention_is_not_overridden_by_fallback(monkeypatch):
+    """Phase 5b: if Groq answers but abstains (no root cause), live mode must
+    NOT fall back to the deterministic fixture answer. That override made the
+    post-Phase-5 live eval report deterministic 0.67 fixture answers as if
+    the LLM had produced them (supervisor model 'demo', tokens 0)."""
+    _live_mode(monkeypatch)
+
+    async def _abstain(*a, **k):
+        return {"root_cause": "", "confidence": 0.0, "tool": "none",
+                "reasoning": "Evidence does not name a specific root cause.",
+                "_tokens": 210, "_cost": 0.00007, "_latency": 900,
+                "_model": "openai/gpt-oss-120b"}
+
+    monkeypatch.setattr(agents_mod, "_groq_hypothesis", _abstain)
+    db = SessionLocal()
+    try:
+        inc = _incident(db, "payments-pool", "phase5b-abstain-1",
+                        title="Payments API timeouts — connection pool exhausted", severity="P1")
+        out = await agents_mod.run_investigation(db, inc)
+        assert out["status"] == "abstained", out
+        assert out.get("tokens") == 210, out
+        hyps = _stored_hypotheses(db, inc.id)
+        assert hyps and hyps[0].status == "abstained"
+        assert "connection pool" not in hyps[0].statement.lower()
+        # Supervisor agent run must record the LLM, not the demo fallback.
+        from app.models import AgentRun
+        runs = db.query(AgentRun).filter_by(incident_id=inc.id, agent="supervisor").all()
+        assert runs and runs[0].model == "openai/gpt-oss-120b" and runs[0].tokens == 210
+    finally:
+        db.close()

@@ -421,22 +421,42 @@ async def run_investigation(db: Session, incident: Incident) -> dict:
         tokens, cost = int(llm.get("_tokens", 0)), float(llm.get("_cost", 0.0))
         _agent_run(db, incident.id, "supervisor", llm.get("_model", settings.groq_model), tokens, cost, int(llm.get("_latency", 0)))
     else:
-        # Phase 8 guard — real-mode deterministic-fallback misattribution:
-        # _deterministic_hypothesis reasons from a synthetic fixture keyed
-        # by scenario. In live mode an ad-hoc/Alertmanager alert has no
-        # known scenario (scenario "" — get_scenario falls back to the
-        # checkout-oom fixture), so if Groq is down the deterministic path
-        # would confidently blame a memory leak it never observed. For an
-        # unknown scenario in live mode, abstain instead of guessing from
-        # a fixture. Demo mode and explicitly simulated known scenarios
-        # keep the deterministic path (labelled demo/synthetic).
-        if not demo_mode and incident.scenario not in SCENARIOS:
-            hyp = {"root_cause": "", "confidence": 0.0, "tool": "none", "abstain": True,
-                   "reasoning": "Live LLM unavailable and this alert matches no known scenario — "
-                   "deterministic demo reasoning must not be applied to a real alert. Manual triage required."}
+        # Phase 5b — respect an explicit LLM abstention. If Groq answered
+        # (llm is not None, no _error) but returned no root cause, the LLM
+        # abstained — most likely because the strengthened prompt told it to
+        # when evidence names no specific root cause. Do NOT override that
+        # with the deterministic fixture path: doing so made the live eval
+        # report deterministic 0.67-confidence fixture answers as if the
+        # LLM had produced them (tokens 0, supervisor model "demo"). The
+        # deterministic fallback below now runs ONLY when Groq actually
+        # failed (groq_error) or is unavailable (llm is None).
+        if not demo_mode and llm is not None and not groq_error:
+            llm_conf = float(llm.get("confidence", 0.0) or 0.0)
+            hyp = {"root_cause": "", "confidence": min(llm_conf, round(ABSTAIN_CONFIDENCE - 0.01, 2)),
+                   "tool": "none", "abstain": True,
+                   "reasoning": str(llm.get("reasoning", "") or "Live LLM abstained: evidence does not name a specific root cause for this incident.")}
+            tokens, cost = int(llm.get("_tokens", 0)), float(llm.get("_cost", 0.0))
+            _agent_run(db, incident.id, "supervisor", llm.get("_model", settings.groq_model), tokens, cost,
+                       int(llm.get("_latency", 0)))
+            _event(db, incident.id, "hypothesis", "supervisor",
+                   {"message": "Live LLM abstained — deterministic fallback not applied", "confidence": hyp["confidence"]})
         else:
-            hyp = _deterministic_hypothesis(incident, scenario, lo, mo, kb_out["out"])
-        _agent_run(db, incident.id, "supervisor", "demo", 0, 0.0, int((time.time() - started) * 1000))
+            # Phase 8 guard — real-mode deterministic-fallback misattribution:
+            # _deterministic_hypothesis reasons from a synthetic fixture keyed
+            # by scenario. In live mode an ad-hoc/Alertmanager alert has no
+            # known scenario (scenario "" — get_scenario falls back to the
+            # checkout-oom fixture), so if Groq is down the deterministic path
+            # would confidently blame a memory leak it never observed. For an
+            # unknown scenario in live mode, abstain instead of guessing from
+            # a fixture. Demo mode and explicitly simulated known scenarios
+            # keep the deterministic path (labelled demo/synthetic).
+            if not demo_mode and incident.scenario not in SCENARIOS:
+                hyp = {"root_cause": "", "confidence": 0.0, "tool": "none", "abstain": True,
+                       "reasoning": "Live LLM unavailable and this alert matches no known scenario — "
+                       "deterministic demo reasoning must not be applied to a real alert. Manual triage required."}
+            else:
+                hyp = _deterministic_hypothesis(incident, scenario, lo, mo, kb_out["out"])
+            _agent_run(db, incident.id, "supervisor", "demo", 0, 0.0, int((time.time() - started) * 1000))
 
     # Phase 5 abstention guard — deterministic, live mode only, LLM path
     # only. The LLM's own confidence is NOT trusted here: a confident
