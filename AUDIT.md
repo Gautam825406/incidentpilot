@@ -170,8 +170,10 @@ no severity-count chart (data too thin — skipped rather than faked).
   for it — but the LLM itself could misread it. Per the honesty rule
   the telemetry/scenario were NOT edited to match the golden answer.
   Distinguishing signals that do exist: CPU 96% + batch job + low error
-  rate (4.2%).
-- **Live accuracy is 0 until the post-deploy live eval re-runs.**
-  The guard-lift is proven only via mocked-Groq tests + a demo-mode
-  smoke test. Do not quote live accuracy numbers until the real
-  `POST /api/evals/run` completes after deploy.
+  rate (4.2%). **Live outcome (11 Nov 2026, run d1777b26): the live LLM
+  diagnosed inventory-cpu correctly** ("Runaway batch job
+  (inventory-reindex) causing CPU saturation", confidence 0.86, semantic
+  hit) — the classifier ambiguity did not mislead the LLM in practice.
+  The finding stands as a caution about the deterministic scorer, not
+  about live behaviour.
+- **Live accuracy is proven non-zero — but only from the post-deploy run.** The guard-lift was proven in mocked-Groq tests + a demo-mode smoke test before deploy; the real proof is live run `d1777b26` (11 Nov 2026): semantic 5/5, exact 1/6, abstention 1/1, unsafe 0 — see README "Latest live eval".
