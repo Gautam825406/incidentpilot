@@ -1,0 +1,32 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: incidentpilot
+      POSTGRES_PASSWORD: incidentpilot
+      POSTGRES_DB: incidentpilot
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+  backend:
+    build: ./backend
+    environment:
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      DATABASE_URL: postgresql://incidentpilot:incidentpilot@postgres:5432/incidentpilot
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      VITE_API_URL: http://localhost:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+volumes:
+  pgdata:

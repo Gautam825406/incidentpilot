@@ -1,0 +1,57 @@
+{
+  "dataset": "golden-v1",
+  "n": 6,
+  "top1_accuracy": 1.0,
+  "correct_top1": 6,
+  "abstention_correct": "1/1",
+  "evidence_coverage": 1.0,
+  "unsafe_actions": 0,
+  "median_latency_ms": 1837,
+  "total_seconds": 11.44,
+  "model": "demo",
+  "demo_mode": true,
+  "per_case": [
+    {
+      "scenario": "checkout-oom",
+      "correct_top1": true,
+      "status": "awaiting_approval",
+      "confidence": 0.91,
+      "latency_ms": 2097
+    },
+    {
+      "scenario": "payments-pool",
+      "correct_top1": true,
+      "status": "awaiting_approval",
+      "confidence": 0.91,
+      "latency_ms": 1833
+    },
+    {
+      "scenario": "search-cache",
+      "correct_top1": true,
+      "status": "awaiting_approval",
+      "confidence": 0.91,
+      "latency_ms": 1882
+    },
+    {
+      "scenario": "auth-cert",
+      "correct_top1": true,
+      "status": "awaiting_approval",
+      "confidence": 0.91,
+      "latency_ms": 1828
+    },
+    {
+      "scenario": "inventory-cpu",
+      "correct_top1": true,
+      "status": "awaiting_approval",
+      "confidence": 0.91,
+      "latency_ms": 1837
+    },
+    {
+      "scenario": "unknown-signal",
+      "correct_top1": true,
+      "status": "abstained",
+      "confidence": 0.0,
+      "latency_ms": 1431
+    }
+  ]
+}
