@@ -1120,7 +1120,19 @@ export default function App() {
     try {
       setSelected(await api.incident(id));
     } catch (e) {
-      flash(`Could not open incident: ${(e as Error).message}`, "error");
+      const msg = (e as Error).message;
+      if (msg.startsWith("404")) {
+        // The incident no longer exists on the backend — e.g. the demo
+        // database was reset by a redeploy while this list was open, or
+        // the incident belongs to another workspace (cross-org ids 404
+        // by design). Drop the stale selection, refresh the list, and
+        // say so in plain words instead of surfacing a raw 404.
+        setSelected(null);
+        await load();
+        flash("That incident no longer exists — the demo data resets when the backend redeploys. Pick one from the refreshed list, or simulate a new alert.", "error");
+        return;
+      }
+      flash(`Could not open incident: ${msg}`, "error");
     }
   };
   const login = async (e?: React.FormEvent) => {

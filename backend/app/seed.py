@@ -9,9 +9,18 @@ Demo login credentials are unchanged.
 from sqlalchemy.orm import Session
 
 from .llm import hash_embedding
-from .models import Document, Incident, EvalRun, Organization, OrganizationMembership, User
+from .models import Document, Incident, EvalRun, IncidentEvent, Organization, OrganizationMembership, User
 from .security import hash_password
-from .synthetic import POSTMORTEMS, RUNBOOKS
+from .synthetic import POSTMORTEMS, RUNBOOKS, SCENARIOS
+
+# Demo incidents seeded into the Demo org on startup. Render's free tier
+# runs SQLite on an ephemeral disk, so every redeploy wipes the database
+# and the demo would otherwise start with zero incidents to open — a
+# stale list in an already-open browser then 404s on "Open". Seeding here
+# (only when the demo org has no incidents at all) keeps the demo usable
+# after every restart. Seeded incidents have no hypotheses yet: opening
+# one shows "Re-run investigation", which runs the real pipeline.
+DEMO_INCIDENTS = ["checkout-oom", "payments-pool"]
 
 DEMO_USERS = [
     ("Admin User", "admin@demo.local", "admin123", "admin"),
@@ -62,4 +71,21 @@ def seed(db: Session):
     db.query(Incident).filter(Incident.org_id.is_(None)).update({Incident.org_id: demo_org.id})
     db.query(Document).filter(Document.org_id.is_(None)).update({Document.org_id: demo_org.id})
     db.query(EvalRun).filter(EvalRun.org_id.is_(None)).update({EvalRun.org_id: demo_org.id})
-    db.commit()
+    # Demo incidents: only when the demo org has none (fresh DB after a
+    # redeploy, or first boot). Never re-seed over real user incidents.
+    if db.query(Incident).filter_by(org_id=demo_org.id).count() == 0:
+        for key in DEMO_INCIDENTS:
+            scenario = SCENARIOS[key]
+            incident = Incident(
+                title=scenario["title"], service=scenario["service"],
+                severity=scenario["severity"], status="open",
+                source="simulator", external_id=f"seed:{key}",
+                scenario=key, org_id=demo_org.id,
+            )
+            db.add(incident)
+            db.commit()
+            db.refresh(incident)
+            db.add(IncidentEvent(incident_id=incident.id, type="alert",
+                                  actor="simulator",
+                                  payload={"message": scenario["alert"]}))
+        db.commit()
