@@ -315,6 +315,8 @@ Measured 2026-11-10 (demo mode, no Groq key — re-run with a key for live-LLM n
 
 Full per-case table: `backend/evals/results.json`. These are demo-mode numbers, not live-LLM results. The true live eval before Phase 5 (run dbd04041, `openai/gpt-oss-120b`, 2026-11-10): exact top-1 0/6, abstention 0/1, evidence 1.0, unsafe 0, median 1170 ms — re-run after Phase 5 for the new live numbers; see the eval section below for the latest live run.
 
+**Latest live eval (Phase 5, 11 Nov 2026, `openai/gpt-oss-120b`, demo_mode: false, n=6, 9.55s, median 1452 ms, 4,952 tokens, $0.0017):** exact top-1 1/6 (the 1 is the abstention case), semantic top-1 0/5, abstention 1/1, evidence 1.0, unsafe 0. Every case used the real LLM (589–962 tokens each). The LLM abstained on all 5 root-cause cases because no Prometheus/log provider is configured — usable evidence is docs only, and the Phase 5 guard refuses to guess from docs alone. That is the intended, honest result: accuracy stays 0 until real log/metric evidence is wired up. A further fix in Phase 5b also made an explicit LLM abstention respected instead of being overridden by the deterministic fixture fallback (which had previously reported fixture answers as if the LLM produced them).
+
 ## Testing
 ```bash
 cd backend && .venv/bin/python -m pytest tests -q   # 117 tests, all mocked — no real infra needed
