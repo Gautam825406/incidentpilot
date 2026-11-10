@@ -1,4 +1,9 @@
-"""Groq LLM client — Groq only, model llama-3.3-70b-versatile.
+"""Groq LLM client — Groq only, model openai/gpt-oss-120b.
+
+Model history: llama-3.3-70b-versatile was retired by Groq for free/developer
+tier on 2026-08-16 (Enterprise only after that) and returns HTTP 404 — that
+is why live runs fell back to the deterministic path. Groq's own replacement
+for it is openai/gpt-oss-120b.
 
 Calls https://api.groq.com/openai/v1/chat/completions with GROQ_API_KEY
 from the environment. No key is ever stored in code. Without a key the
@@ -14,8 +19,8 @@ from .config import settings
 
 # Groq pricing (approx, public list price at time of writing) — used only
 # for cost *estimates* shown in the UI; labelled as estimated.
-PRICE_PER_1M_INPUT = 0.59
-PRICE_PER_1M_OUTPUT = 0.79
+PRICE_PER_1M_INPUT = 0.15
+PRICE_PER_1M_OUTPUT = 0.60
 
 
 class GroqClient:

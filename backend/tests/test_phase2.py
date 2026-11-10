@@ -429,3 +429,9 @@ def test_groq_failure_is_recorded_not_silent(monkeypatch):
     evs = db.query(IncidentEvent).filter_by(incident_id=inc.id, type="groq_failed").all()
     assert len(evs) == 1 and "401" in str(evs[0].payload.get("error", ""))
     assert "gsk_" not in out["groq_error"]
+
+def test_default_groq_model_is_current():
+    """llama-3.3-70b-versatile was retired by Groq for free/dev tier (2026-08-16, HTTP 404);
+    the default must be Groq's own replacement, openai/gpt-oss-120b."""
+    from app.config import settings
+    assert settings.groq_model == "openai/gpt-oss-120b"

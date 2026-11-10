@@ -4,23 +4,44 @@ No real secret is ever committed. GROQ_API_KEY is optional: without it
 IncidentPilot runs in DEMO MODE (deterministic, fixture-based investigation)
 and labels itself as such in the UI and API responses.
 """
+import logging
 import os
 from pydantic_settings import BaseSettings
+
+logger = logging.getLogger(__name__)
+
+# The demo JWT secret shipped in code. It is intentionally unchanged so
+# existing demo deployments keep working — but a live (non-demo) deployment
+# must replace it: see validate_production_settings() below.
+DEMO_JWT_SECRET = "demo-secret-change-me-in-production"
 
 
 class Settings(BaseSettings):
     app_name: str = "IncidentPilot"
     groq_api_key: str = ""
-    groq_model: str = "llama-3.3-70b-versatile"
+    groq_model: str = "openai/gpt-oss-120b"
     groq_base_url: str = "https://api.groq.com/openai/v1"
+    # Postgres is the primary database path. SQLite is the local/demo
+    # fallback only: the default below keeps local dev and the test suite
+    # (which uses scratch SQLite files) working with no setup. Set
+    # DATABASE_URL to a Postgres URL for any shared/production deployment
+    # — see README "Postgres setup (Neon / Supabase free tier)".
     database_url: str = "sqlite:///./incidentpilot.db"
-    jwt_secret: str = "demo-secret-change-me-in-production"
+    jwt_secret: str = DEMO_JWT_SECRET
     jwt_algorithm: str = "HS256"
     token_budget_per_incident: int = 60000  # tokens
     max_investigation_rounds: int = 3
     confidence_threshold: float = 0.65
     plan_expiry_minutes: int = 30
-    cors_origins: str = "*"
+    # CORS allow-list (comma-separated). Default covers local dev plus the
+    # production frontend; "*" is kept only when explicitly set.
+    cors_origins: str = "http://localhost:5173,http://localhost:3000,https://incidentpilot-ten.vercel.app"
+    # Rate limiting (in-memory sliding window, per IP; see app/rate_limit.py).
+    # Set RATE_LIMIT_ENABLED=false to disable (e.g. behind a proxy that
+    # already rate-limits, or in tests — see tests/conftest.py).
+    rate_limit_enabled: bool = True
+    rate_limit_login_per_minute: int = 10
+    rate_limit_webhook_per_minute: int = 60
     # Phase 2 — Prometheus (optional; empty = not configured, demo mode unaffected)
     prometheus_url: str = ""
     prometheus_auth_token: str = ""
@@ -59,9 +80,50 @@ class Settings(BaseSettings):
     def demo_mode(self) -> bool:
         return not bool(self.groq_api_key and self.groq_api_key.strip())
 
+    @property
+    def cors_origin_list(self) -> list[str]:
+        """Parsed CORS allow-list. A bare "*" stays "*" (explicit opt-in
+        to wide-open CORS); anything else is a comma-separated list."""
+        raw = (self.cors_origins or "").strip()
+        if raw == "*":
+            return ["*"]
+        return [o.strip() for o in raw.split(",") if o.strip()]
+
+    @property
+    def is_postgres(self) -> bool:
+        url = (self.database_url or "").strip().lower()
+        return url.startswith("postgresql://") or url.startswith("postgres://")
+
+    @property
+    def is_sqlite(self) -> bool:
+        return (self.database_url or "").strip().lower().startswith("sqlite")
+
     class Config:
         env_file = ".env"
         extra = "ignore"
+
+
+def validate_production_settings(s: "Settings") -> None:
+    """Fail loudly when a live deployment still uses the demo JWT secret.
+
+    Called once at app startup (main.py imports it). The check is
+    deliberately env-driven and import-time: production settings come from
+    the environment, which is fixed by the time the app starts. In demo
+    mode (no Groq key) the default secret is expected, so it only warns.
+    A custom JWT_SECRET always passes, in either mode.
+    """
+    if s.jwt_secret == DEMO_JWT_SECRET:
+        if not s.demo_mode:
+            raise RuntimeError(
+                "JWT_SECRET is still the demo default but GROQ_API_KEY is set "
+                "(live mode). Refusing to start: set a strong, unique "
+                "JWT_SECRET environment variable. The demo default must never "
+                "sign tokens in production."
+            )
+        logger.warning(
+            "JWT_SECRET is the demo default and the app is in demo mode. "
+            "Set a strong JWT_SECRET before enabling live mode."
+        )
 
 
 settings = Settings()
