@@ -22,6 +22,7 @@ from app.executor import ALLOW_LIST, execute_plan  # noqa: E402
 from app.models import EvalRun, Hypothesis, Incident, RemediationPlan  # noqa: E402
 from app.seed import seed  # noqa: E402
 from app.synthetic import GOLDEN_SET, get_scenario  # noqa: E402
+from app.telemetry import emit_scenario_telemetry  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Semantic matching (Phase 5 Step 2) — deterministic keyword/mechanism
@@ -178,6 +179,11 @@ async def run_all(db=None):
         inc = Incident(title=sc["title"], service=sc["service"], severity=sc["severity"],
                        source="eval", external_id=f"eval-{uuid.uuid4().hex[:8]}", scenario=case["scenario"])
         db.add(inc); db.commit(); db.refresh(inc)
+        # Phase 6 — emit this case's telemetry BEFORE the investigation
+        # runs, tagged with the incident's external_id (the run_id the
+        # agents scope their reads to), so cases cannot leak signals into
+        # each other. Only the scenario's logs/metrics are emitted.
+        emit_scenario_telemetry(sc, inc.external_id)
         t0 = time.time()
         out = await run_investigation(db, inc)
         latency_ms = int((time.time() - t0) * 1000)

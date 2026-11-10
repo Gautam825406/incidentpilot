@@ -14,24 +14,24 @@ from .synthetic import POSTMORTEMS, RUNBOOKS, SERVICE_STATE, get_scenario
 
 
 class SearchLogsInput(BaseModel):
-    service: str
-    pattern: str = ""
+    service: str = Field(max_length=128)
+    pattern: str = Field(default="", max_length=1000)
     window_minutes: int = Field(default=15, ge=1, le=1440)
 
 
 class MetricsInput(BaseModel):
-    service: str
+    service: str = Field(max_length=128)
 
 
 class KnowledgeInput(BaseModel):
-    query: str
-    service: str = ""
+    query: str = Field(max_length=1000)
+    service: str = Field(default="", max_length=128)
     top_k: int = Field(default=3, ge=1, le=10)
 
 
 class ExecutorInput(BaseModel):
-    tool: str
-    service: str
+    tool: str = Field(max_length=64)
+    service: str = Field(max_length=128)
     replicas: int = Field(default=2, ge=1, le=10)
 
 

@@ -95,7 +95,7 @@ export default function Landing({ health, onEnter }: { health: Any | null; onEnt
       </section>
 
       <footer className="landing-footer">
-        <span>IncidentPilot v1 · Simulated services only · No Slack/Jira in v1</span>
+        <span>IncidentPilot v1 · Simulated services only · Jira &amp; Slack optional via backend env</span>
         <span>Built by Gautam Keshri · <a href="https://github.com/Gautam825406/incidentpilot" target="_blank" rel="noreferrer">GitHub</a></span>
       </footer>
     </div>

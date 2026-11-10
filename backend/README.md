@@ -1,6 +1,6 @@
 # IncidentPilot — Backend
 
-FastAPI + LangGraph supervisor + Groq (`llama-3.3-70b-versatile`) + SQLAlchemy (Postgres/pgvector-ready, SQLite demo fallback).
+FastAPI + LangGraph supervisor + Groq (`openai/gpt-oss-120b`) + SQLAlchemy (Postgres/pgvector-ready, SQLite demo fallback).
 
 ## Run
 ```bash

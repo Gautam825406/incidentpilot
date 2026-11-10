@@ -38,7 +38,9 @@ services:
   # Optional local Prometheus — only started with the `monitoring` profile,
   # so the default `docker compose up` is unchanged:
   #   PROMETHEUS_URL=http://prometheus:9090 docker compose --profile monitoring up --build
-  # Then point it at your services by adding scrape jobs to prometheus.yml.
+  # prometheus.yml already scrapes the backend's /metrics endpoint
+  # (job 'incidentpilot-backend', target backend:8000) in addition to
+  # itself, so the embedded telemetry counters are visible in Prometheus.
   prometheus:
     image: prom/prometheus:latest
     profiles: ["monitoring"]

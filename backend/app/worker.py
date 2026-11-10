@@ -27,6 +27,8 @@ from .agents import run_investigation
 from .database import SessionLocal
 from .integrations.slack import get_slack_client
 from .models import Incident
+from .synthetic import SCENARIOS, get_scenario
+from .telemetry import emit_scenario_telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +103,14 @@ class InvestigationWorker:
             inc = db.query(Incident).filter_by(id=incident_id).first()
             if not inc:
                 return
+            # Phase 6 — a scenario incident investigated off the request
+            # path needs its telemetry too, emitted BEFORE the
+            # investigation runs and tagged with the incident's
+            # external_id. Ad-hoc / Alertmanager alerts have no known
+            # scenario (scenario ""), so nothing is emitted for them and
+            # they correctly abstain when there is no evidence.
+            if inc.scenario in SCENARIOS:
+                emit_scenario_telemetry(get_scenario(inc.scenario), inc.external_id)
             result = await run_investigation(db, inc)
             if result.get("status") == "abstained":
                 await notify_slack_best_effort("new_incident", inc)

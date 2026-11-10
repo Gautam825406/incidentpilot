@@ -130,7 +130,7 @@ async def test_live_well_evidenced_case_still_proposes(monkeypatch):
                 "_tokens": 150, "_cost": 0.0, "_latency": 60,
                 "_model": "openai/gpt-oss-120b"}
 
-    async def _fake_logs(service, created_at):
+    async def _fake_logs(service, created_at, run_id=None):
         return {"provider": "elasticsearch", "available": True,
                 "entries": [
                     {"message": "java.lang.OutOfMemoryError: Java heap space at pricing.PricingEngine.calculate",
@@ -144,7 +144,7 @@ async def test_live_well_evidenced_case_still_proposes(monkeypatch):
                             "last_seen": "2026-11-10T14:02:31Z"}],
                 "error": None}
 
-    async def _fake_metrics(service):
+    async def _fake_metrics(service, run_id=None):
         def _m(value, unit, query=""):
             return {"available": True, "value": value, "unit": unit, "query": query}
         return {"error_rate": _m(18.7, "%"), "latency": _m(2400, "ms"),

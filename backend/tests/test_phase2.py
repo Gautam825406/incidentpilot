@@ -231,8 +231,11 @@ def test_integrations_status_unconfigured():
     body = r.json()
     assert body["prometheus"]["configured"] is False
     assert body["prometheus"]["reachable"] is None
-    assert body["logs"]["provider"] == "none"
-    assert body["logs"]["configured"] is False
+    # Phase 6: no external Prometheus URL, so the metrics provider is the
+    # embedded telemetry store — reported as such, not as "not configured".
+    assert body["prometheus"]["provider"] == "embedded"
+    assert body["logs"]["provider"] == "embedded"
+    assert body["logs"]["configured"] is True
     assert body["grafana"]["configured"] is False
     # No secret material is ever exposed here.
     assert "token" not in r.text.lower() and "secret" not in r.text.lower()
@@ -290,13 +293,13 @@ def test_simulate_checkout_oom_investigates_with_hypothesis():
     assert body["status"] == "awaiting_approval"
     assert body["investigation"]["demo_mode"] is True
     assert "integrations" in body["investigation"]
-    assert body["investigation"]["integrations"]["logs"]["provider"] == "none"
+    assert body["investigation"]["integrations"]["logs"]["provider"] == "embedded"
     detail = client.get(f"/api/incidents/{body['incident_id']}").json()
     assert detail["hypotheses"], "hypothesis must be present"
     assert detail["hypotheses"][0]["statement"].startswith("Memory leak")
     assert detail["hypotheses"][0]["confidence"] >= 0.65
     assert detail["plan"]["status"] == "pending"
-    assert detail["monitoring"]["logs_provider"] == "none"
+    assert detail["monitoring"]["logs_provider"] == "embedded"
     assert detail["monitoring"]["prometheus_configured"] is False
 
 

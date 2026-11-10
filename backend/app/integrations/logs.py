@@ -22,6 +22,12 @@ investigation records an ``integration_unavailable`` evidence item and
 collects no log evidence — entries are never invented. Demo mode keeps
 using the synthetic fixtures in ``synthetic.py``.
 
+Phase 6 — embedded provider: with no Elasticsearch / OpenSearch URL
+configured, :func:`get_log_provider` returns :class:`EmbeddedLogProvider`,
+which reads the telemetry the simulated services emit into
+``app.telemetry`` when a scenario is triggered. It is labelled
+"embedded" everywhere and never pretends to be an external cluster.
+
 Configuration (read from ``settings`` with an environment fallback;
 credentials are never logged):
 
@@ -39,7 +45,7 @@ import os
 import re
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
@@ -104,8 +110,11 @@ class LogProvider(ABC):
         end: "str | datetime",
         level: str = "error",
         limit: int = 50,
+        run_id: str | None = None,
     ) -> list[LogEntry]:
-        ...
+        """Search log lines. ``run_id`` (Phase 6) optionally scopes the
+        search to one simulation run; providers that do not support it
+        ignore it and query by time window."""
 
     @abstractmethod
     async def health(self) -> dict:
@@ -206,7 +215,10 @@ class _SearchProvider(LogProvider):
         end: "str | datetime",
         level: str = "error",
         limit: int = 50,
+        run_id: str | None = None,
     ) -> list[LogEntry]:
+        # run_id is ignored: a real Elasticsearch/OpenSearch backend is
+        # queried by time window, not by simulation run.
         payload = self._query(service, _iso(start), _iso(end), level, limit)
         last_error: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):
@@ -297,6 +309,60 @@ class OpenSearchProvider(_SearchProvider):
         return headers
 
 
+class EmbeddedLogProvider(LogProvider):
+    """Phase 6 — logs emitted by the simulated services themselves.
+
+    Reads the in-process telemetry store (``app.telemetry``) that the
+    simulator feeds when a scenario is triggered. This is the DEFAULT
+    provider when no Elasticsearch / OpenSearch URL is configured: the
+    live agents then have real (simulated-service) log evidence instead
+    of nothing. It is labelled "embedded" everywhere — it never pretends
+    to be an external Elasticsearch/OpenSearch cluster.
+
+    ``run_id`` scopes the search to one simulation run (the incident's
+    external_id); without it the time window applies, as for a real
+    backend. Level matching is exact: level="error" returns error lines
+    only — callers that also want warnings query twice and merge.
+    """
+
+    @property
+    def provider_name(self) -> str:
+        return "embedded"
+
+    async def search(
+        self,
+        service: str,
+        start: "str | datetime",
+        end: "str | datetime",
+        level: str = "error",
+        limit: int = 50,
+        run_id: str | None = None,
+    ) -> list[LogEntry]:
+        from ..telemetry import store as telemetry_store
+
+        def _to_dt(value: "str | datetime") -> datetime:
+            if isinstance(value, datetime):
+                dt = value
+            else:
+                dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+        rows = telemetry_store.query_logs(
+            service, _to_dt(start), _to_dt(end),
+            levels=(level.upper(),), run_id=run_id, limit=limit)
+        out = []
+        for row in rows:
+            ts = row["timestamp"]
+            out.append(LogEntry(
+                timestamp=ts.isoformat().replace("+00:00", "Z") if isinstance(ts, datetime) else str(ts),
+                service=row["service"], level=row["level"], message=row["message"],
+                source="embedded", exception_type=row.get("exception_type")))
+        return out
+
+    async def health(self) -> dict:
+        return {"reachable": True, "provider": "embedded", "error": None}
+
+
 class NoLogProvider(LogProvider):
     """Fallback when no real log provider is configured (demo mode)."""
 
@@ -311,6 +377,7 @@ class NoLogProvider(LogProvider):
         end: "str | datetime",
         level: str = "error",
         limit: int = 50,
+        run_id: str | None = None,
     ) -> list[LogEntry]:
         raise LogProviderError("no log provider configured")
 
@@ -319,13 +386,19 @@ class NoLogProvider(LogProvider):
 
 
 def get_log_provider() -> LogProvider:
-    """Return the configured provider: Elasticsearch first, then OpenSearch,
-    else :class:`NoLogProvider`. Never logs credentials."""
+    """Return the configured provider: Elasticsearch first, then
+    OpenSearch, else the Phase 6 embedded provider (telemetry emitted by
+    the simulated services). Never logs credentials.
+
+    The embedded provider is the default when nothing external is
+    configured — ``NoLogProvider`` is kept for callers that explicitly
+    need the "no provider" behaviour (and its unit tests).
+    """
     if _setting("elasticsearch_url", "ELASTICSEARCH_URL"):
         return ElasticsearchProvider()
     if _setting("opensearch_url", "OPENSEARCH_URL"):
         return OpenSearchProvider()
-    return NoLogProvider()
+    return EmbeddedLogProvider()
 
 
 # --- Aggregation / evidence ------------------------------------------------
@@ -400,13 +473,19 @@ async def search_logs_real(
     end: "str | datetime",
     level: str = "error",
     limit: int = 50,
+    run_id: str | None = None,
 ) -> dict:
     """Search real logs via the configured provider.
 
     Returns {"provider", "available", "entries", "groups", "error"}.
-    ``available`` is False (with ``error`` set and ``entries`` empty) when no
-    provider is configured or the provider is unreachable — entries are
-    never fabricated in that case.
+    ``available`` is False (with ``error`` set and ``entries`` empty) when
+    the provider is unreachable — entries are never fabricated in that
+    case. With no external provider configured the Phase 6 embedded
+    provider answers from the simulated services' own telemetry (which
+    may legitimately be empty: ``available`` True, ``entries`` []).
+
+    ``run_id`` scopes the search to one simulation run (the incident's
+    external_id); external providers ignore it and query by time window.
     """
     provider = get_log_provider()
     if isinstance(provider, NoLogProvider):
@@ -418,6 +497,11 @@ async def search_logs_real(
             "error": "no log provider configured",
         }
     try:
+        entries = await provider.search(service, start, end, level=level,
+                                        limit=limit, run_id=run_id)
+    except TypeError:
+        # Providers that predate the run_id parameter (e.g. a test double
+        # with the old search signature) are called without it.
         entries = await provider.search(service, start, end, level=level, limit=limit)
     except LogProviderError as exc:
         return {

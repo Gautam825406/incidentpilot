@@ -61,27 +61,60 @@ def verify_password(password: str, password_hash: str) -> bool:
     return hmac.compare_digest(legacy, password_hash)
 
 
+def is_legacy_hash(password_hash: str) -> bool:
+    """True when ``password_hash`` is a pre–Phase 4 bare hex hash (fixed
+    salt, no ``"$"`` separator). Legacy hashes still verify, but a
+    successful login upgrades them to a per-user random salt (see
+    main.py login) so the fixed salt disappears over time. The legacy
+    users are the public demo accounts (admin123 etc. are in the README),
+    so the fixed salt was never a secret — but one shared salt for every
+    user is still weaker than per-user salts, hence the upgrade."""
+    return "$" not in password_hash
+
+
 def _b64(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
+def _b64_decode(segment: str) -> bytes:
+    return base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
+
+
 def create_token(user_id: str, email: str, role: str, expires_in: int = 86400) -> str:
+    now = int(time.time())
     header = _b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
     payload = _b64(
-        json.dumps({"sub": user_id, "email": email, "role": role, "exp": int(time.time()) + expires_in}).encode()
+        json.dumps({"sub": user_id, "email": email, "role": role, "iat": now, "exp": now + expires_in}).encode()
     )
     sig = _b64(hmac.new(settings.jwt_secret.encode(), f"{header}.{payload}".encode(), hashlib.sha256).digest())
     return f"{header}.{payload}.{sig}"
 
 
 def verify_token(token: str) -> Optional[dict]:
+    """Verify a JWT. Defence-in-depth beyond the HMAC (the signature
+    already covers header+payload, so a forged header cannot pass
+    without the secret): the header must declare exactly alg HS256 /
+    typ JWT (algorithm-confusion defence — a token claiming ``alg:
+    none`` or an asymmetric alg is rejected before the payload is
+    trusted), and the payload must carry a string sub/email/role and
+    an integer exp in the future."""
     try:
         header, payload, sig = token.split(".")
+        header_data = json.loads(_b64_decode(header))
+        if header_data.get("alg") != "HS256" or header_data.get("typ") != "JWT":
+            return None
         expected = _b64(hmac.new(settings.jwt_secret.encode(), f"{header}.{payload}".encode(), hashlib.sha256).digest())
         if not hmac.compare_digest(sig, expected):
             return None
-        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        if data.get("exp", 0) < time.time():
+        data = json.loads(_b64_decode(payload))
+        if not isinstance(data.get("sub"), str) or not data["sub"]:
+            return None
+        if not isinstance(data.get("email"), str) or not data["email"]:
+            return None
+        if not isinstance(data.get("role"), str) or not data["role"]:
+            return None
+        exp = data.get("exp")
+        if not isinstance(exp, int) or exp < time.time():
             return None
         return data
     except Exception:
@@ -89,10 +122,23 @@ def verify_token(token: str) -> Optional[dict]:
 
 
 def redact_pii(text: str) -> str:
-    """Redact emails, bearer tokens, and long hex secrets from log text."""
+    """Redact emails, bearer tokens, credential assignments, and
+    recognisable API-token shapes from log text. Only credential-shaped
+    values are redacted — plain hashes/UUIDs in logs are left alone so
+    evidence stays readable."""
     text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[EMAIL]", text)
     text = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9\-._~+/=]{10,}", r"\1[REDACTED]", text)
     text = re.sub(r"(?i)(api[_-]?key\s*[:=]\s*)[A-Za-z0-9\-_]{8,}", r"\1[REDACTED]", text)
+    # Credential assignments: password=... / passwd: ... / secret=... /
+    # token=... — keep the key name, drop the value.
+    text = re.sub(r"(?i)(password|passwd|pwd|secret|auth[_-]?token|access[_-]?token)\s*[:=]\s*\S+", r"\1=[REDACTED]", text)
+    # Recognisable token shapes: Groq gsk_..., OpenAI sk-..., Slack xox*,
+    # AWS AKIA..., GitHub ghp_/gho_/github_pat_....
+    text = re.sub(r"gsk_[A-Za-z0-9]{8,}", "[REDACTED]", text)
+    text = re.sub(r"sk-[A-Za-z0-9]{8,}", "[REDACTED]", text)
+    text = re.sub(r"xox[baprs]-[A-Za-z0-9-]{8,}", "[REDACTED]", text)
+    text = re.sub(r"AKIA[A-Z0-9]{16}", "[REDACTED]", text)
+    text = re.sub(r"(ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{8,}", "[REDACTED]", text)
     return text
 
 

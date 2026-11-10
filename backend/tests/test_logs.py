@@ -8,6 +8,7 @@ import pytest
 
 from app.integrations import logs as logs_mod
 from app.integrations.logs import (
+    EmbeddedLogProvider,
     ElasticsearchProvider,
     LogEntry,
     LogProviderError,
@@ -212,15 +213,19 @@ async def test_5xx_retried_then_raises():
     assert calls["n"] == 3  # 1 attempt + 2 retries
 
 
-# (f) No provider configured -> NoLogProvider ------------------------------
-def test_get_log_provider_none_when_unconfigured(monkeypatch):
+# (f) No external provider configured -> embedded provider (Phase 6) ------
+# The default is the embedded telemetry store, NOT "none": the simulated
+# services emit their own logs/metrics, so live agents have real evidence
+# instead of nothing. NoLogProvider still exists for callers that
+# explicitly need the "no provider" behaviour (tested below).
+def test_get_log_provider_embedded_when_unconfigured(monkeypatch):
     monkeypatch.delenv("ELASTICSEARCH_URL", raising=False)
     monkeypatch.delenv("OPENSEARCH_URL", raising=False)
     # settings has no elasticsearch/opensearch fields (parallel change may
     # add them with empty defaults) — either way getattr must yield falsy.
     provider = get_log_provider()
-    assert isinstance(provider, NoLogProvider)
-    assert provider.provider_name == "none"
+    assert isinstance(provider, EmbeddedLogProvider)
+    assert provider.provider_name == "embedded"
 
 
 @pytest.mark.asyncio
@@ -235,16 +240,22 @@ async def test_no_log_provider_search_raises_and_health():
 
 
 @pytest.mark.asyncio
-async def test_search_logs_real_unavailable_without_provider(monkeypatch):
+async def test_search_logs_real_embedded_empty_when_unconfigured(monkeypatch):
+    """Phase 6: with no external provider the embedded provider answers.
+    With nothing emitted yet the store is empty — available True (the
+    provider itself is up), entries [] (no telemetry, never invented)."""
     monkeypatch.delenv("ELASTICSEARCH_URL", raising=False)
     monkeypatch.delenv("OPENSEARCH_URL", raising=False)
+    from app.telemetry import store as telemetry_store
+
+    telemetry_store.reset()
     result = await search_logs_real("checkout-api", START, END)
     assert result == {
-        "provider": "none",
-        "available": False,
+        "provider": "embedded",
+        "available": True,
         "entries": [],
         "groups": [],
-        "error": "no log provider configured",
+        "error": None,
     }
 
 

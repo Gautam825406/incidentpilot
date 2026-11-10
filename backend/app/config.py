@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     rate_limit_enabled: bool = True
     rate_limit_login_per_minute: int = 10
     rate_limit_webhook_per_minute: int = 60
+    # LLM-cost endpoints: /api/simulate, /api/incidents/{id}/investigate
+    # and /api/evals/run each trigger Groq calls. Unauthenticated
+    # simulate/investigate stay open (the demo path), but per-IP rate
+    # limiting caps abuse. See app/main.py investigate_limiter.
+    rate_limit_investigate_per_minute: int = 10
     # Phase 2 — Prometheus (optional; empty = not configured, demo mode unaffected)
     prometheus_url: str = ""
     prometheus_auth_token: str = ""

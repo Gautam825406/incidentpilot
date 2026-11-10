@@ -16,10 +16,12 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _reset_rate_limiters():
-    from app.main import login_limiter, webhook_limiter
+    from app.main import investigate_limiter, login_limiter, webhook_limiter
 
     login_limiter.reset()
     webhook_limiter.reset()
+    investigate_limiter.reset()
     yield
     login_limiter.reset()
     webhook_limiter.reset()
+    investigate_limiter.reset()

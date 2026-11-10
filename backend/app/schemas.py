@@ -1,7 +1,16 @@
-"""Pydantic request/response schemas — every tool and API input is validated here."""
+"""Pydantic request/response schemas — every tool and API input is validated here.
+
+Length limits (security review): every free-text field is capped so a
+single request cannot smuggle megabytes of text into the DB, the LLM
+prompt, or an incident event. Caps are generous for legitimate use
+(runbook content up to 100k, alert titles up to 500 chars) and reject
+with a plain 422, never a crash. Severity stays a free string (callers
+send P1–P3 and Alertmanager severities such as "critical"); only its
+length is capped.
+"""
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .config import settings
 
@@ -12,63 +21,89 @@ class NotifyIn(BaseModel):
 
 
 class LoginIn(BaseModel):
-    email: str
-    password: str
+    email: str = Field(max_length=254)
+    password: str = Field(max_length=256)
 
 
 class AlertIn(BaseModel):
-    title: str
-    service: str
-    severity: str = "P2"
-    source: str = "webhook"
-    external_id: Optional[str] = None
+    title: str = Field(max_length=500)
+    service: str = Field(max_length=128)
+    severity: str = Field(default="P2", max_length=16)
+    source: str = Field(default="webhook", max_length=64)
+    external_id: Optional[str] = Field(default=None, max_length=128)
 
 
 class SimulateIn(BaseModel):
-    scenario: str = "checkout-oom"
+    scenario: str = Field(default="checkout-oom", max_length=128)
 
 
 class AlertmanagerAlert(BaseModel):
     """One alert inside a Prometheus Alertmanager webhook payload (Phase 3)."""
-    status: str = "firing"  # firing | resolved
+    status: str = Field(default="firing", max_length=32)  # firing | resolved
     labels: dict[str, str] = Field(default_factory=dict)
     annotations: dict[str, str] = Field(default_factory=dict)
-    startsAt: Optional[str] = None
-    endsAt: Optional[str] = None
-    fingerprint: Optional[str] = None
-    generatorURL: Optional[str] = None
+    startsAt: Optional[str] = Field(default=None, max_length=64)
+    endsAt: Optional[str] = Field(default=None, max_length=64)
+    fingerprint: Optional[str] = Field(default=None, max_length=128)
+    generatorURL: Optional[str] = Field(default=None, max_length=512)
+
+    @field_validator("labels", "annotations")
+    @classmethod
+    def _cap_mapping(cls, v: dict[str, str]) -> dict[str, str]:
+        if len(v) > 100:
+            raise ValueError("at most 100 labels/annotations per alert")
+        for k, val in v.items():
+            if len(k) > 256 or len(val) > 4096:
+                raise ValueError("label/annotation key/value too long")
+        return v
 
 
 class AlertmanagerPayload(BaseModel):
     """Top-level Prometheus Alertmanager webhook payload (Phase 3)."""
-    version: Optional[str] = None
-    groupKey: Optional[str] = None
-    status: Optional[str] = None
-    receiver: Optional[str] = None
+    version: Optional[str] = Field(default=None, max_length=32)
+    groupKey: Optional[str] = Field(default=None, max_length=256)
+    status: Optional[str] = Field(default=None, max_length=32)
+    receiver: Optional[str] = Field(default=None, max_length=128)
     groupLabels: dict[str, str] = Field(default_factory=dict)
     commonLabels: dict[str, str] = Field(default_factory=dict)
     commonAnnotations: dict[str, str] = Field(default_factory=dict)
-    alerts: list[AlertmanagerAlert] = Field(default_factory=list)
+    alerts: list[AlertmanagerAlert] = Field(default_factory=list, max_length=100)
+
+    @field_validator("groupLabels", "commonLabels", "commonAnnotations")
+    @classmethod
+    def _cap_common_mapping(cls, v: dict[str, str]) -> dict[str, str]:
+        if len(v) > 100:
+            raise ValueError("at most 100 labels/annotations")
+        for k, val in v.items():
+            if len(k) > 256 or len(val) > 4096:
+                raise ValueError("label/annotation key/value too long")
+        return v
 
 
 class PlanEditIn(BaseModel):
-    steps: list[dict] = Field(default_factory=list)
+    steps: list[dict] = Field(default_factory=list, max_length=50)
 
 
 class RejectIn(BaseModel):
-    reason: str = ""
+    reason: str = Field(default="", max_length=1000)
 
 
 class ExecuteIn(BaseModel):
     dry_run: bool = False
-    approval_token: Optional[str] = None
+    approval_token: Optional[str] = Field(default=None, max_length=128)
 
 
 class DocumentIn(BaseModel):
-    title: str
-    kind: str = "runbook"
-    service: str = ""
-    content: str
+    title: str = Field(max_length=300)
+    kind: str = Field(default="runbook", max_length=32)
+    service: str = Field(default="", max_length=128)
+    content: str = Field(max_length=100_000)
+
+
+class KnowledgeSearchIn(BaseModel):
+    """POST /api/knowledge/search — previously an unvalidated raw dict."""
+    query: str = Field(default="", max_length=1000)
+    service: str = Field(default="", max_length=128)
 
 
 def incident_out(i) -> dict:

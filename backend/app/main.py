@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
@@ -28,13 +28,14 @@ from .executor import execute_plan, postmortem_draft, verify_recovery
 from .integrations.grafana import dashboard_url, grafana_status
 from .integrations.jira import JiraClient, JiraError, jira_status
 from .integrations.logs import get_log_provider
-from .integrations.prometheus import PrometheusClient
+from .integrations.prometheus import PrometheusClient, get_prometheus_client
 from .integrations.slack import SlackClient, SlackError, slack_status
 from .llm import hash_embedding
+from .telemetry import emit_scenario_telemetry, store as telemetry_store
 from .models import AgentRun, Document, EvalRun, Evidence, Hypothesis, Incident, IncidentEvent, RemediationPlan, User
 from .rate_limit import RateLimiter
-from .schemas import AlertIn, AlertmanagerPayload, DocumentIn, ExecuteIn, LoginIn, NotifyIn, PlanEditIn, RejectIn, SimulateIn, incident_out
-from .security import create_token, verify_password, verify_token
+from .schemas import AlertIn, AlertmanagerPayload, DocumentIn, ExecuteIn, KnowledgeSearchIn, LoginIn, NotifyIn, PlanEditIn, RejectIn, SimulateIn, incident_out
+from .security import create_token, hash_password, is_legacy_hash, redact_pii, verify_password, verify_token
 from .seed import seed
 from .synthetic import SERVICE_STATE, get_scenario, list_scenarios
 from .tools import KnowledgeInput, search_knowledge
@@ -57,9 +58,45 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="IncidentPilot", version="1.0.0",
               description="Multi-agent production incident resolver — LangGraph + Groq (demo mode without a key).",
               lifespan=lifespan)
+
+
+def _cors_allow_credentials(origins: list[str]) -> bool:
+    """Credentials (Authorization header / cookies) must never be sent
+    with a wildcard origin: browsers ignore credentials on ``*`` and a
+    reflected-origin setup would hand the demo JWT to any site. Only an
+    explicit allow-list gets credentials."""
+    return "*" not in origins
+
+
 # CORS is an env-configured allow-list (Phase 4); "*" only when explicitly
-# set via CORS_ORIGINS. See config.py cors_origin_list.
-app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+# set via CORS_ORIGINS. See config.py cors_origin_list. Credentials are
+# disabled when the list is "*" (see _cors_allow_credentials).
+app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list,
+                   allow_credentials=_cors_allow_credentials(settings.cors_origin_list),
+                   allow_methods=["*"], allow_headers=["*"])
+if "*" in settings.cors_origin_list:
+    logger.warning("CORS_ORIGINS is '*' — credentials are disabled and any origin may call the API. "
+                   "Set an explicit allow-list for a shared deployment.")
+
+
+# Request-body size cap (security review): no legitimate request here is
+# large (largest is a runbook at 100k), so a 1 MB Content-Length cap
+# blocks body-flood DoS without touching normal use. Requests without a
+# Content-Length header (chunked) are not capped by this check — the
+# per-field Pydantic limits still bound what is stored.
+MAX_REQUEST_BODY_BYTES = 1_000_000
+
+
+@app.middleware("http")
+async def _limit_request_body_size(request: Request, call_next):
+    length = request.headers.get("content-length")
+    if length is not None:
+        try:
+            if int(length) > MAX_REQUEST_BODY_BYTES:
+                return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+        except ValueError:
+            pass
+    return await call_next(request)
 _graph = build_graph()  # LangGraph graph with MemorySaver checkpointer (None if langgraph unavailable)
 
 init_db()
@@ -75,6 +112,12 @@ with SessionLocal() as _db:
 # deliberately generic: it reveals nothing about accounts or internals.
 login_limiter = RateLimiter(limit=settings.rate_limit_login_per_minute)
 webhook_limiter = RateLimiter(limit=settings.rate_limit_webhook_per_minute)
+# LLM-cost endpoints: /api/simulate, /api/incidents/{id}/investigate and
+# /api/evals/run each trigger Groq calls. They stay open to demo users
+# (no auth on simulate/investigate by design), but per-IP rate limiting
+# caps unauthenticated cost abuse. Same reset hook as the other limiters
+# (tests/conftest.py).
+investigate_limiter = RateLimiter(limit=settings.rate_limit_investigate_per_minute)
 
 
 def _client_ip(request: Request) -> str:
@@ -89,6 +132,11 @@ def _rate_limit_login(request: Request):
 def _rate_limit_webhook(request: Request):
     if settings.rate_limit_enabled and not webhook_limiter.allow(_client_ip(request)):
         raise HTTPException(status_code=429, detail="Too many alert requests — try again later")
+
+
+def _rate_limit_investigate(request: Request):
+    if settings.rate_limit_enabled and not investigate_limiter.allow(_client_ip(request)):
+        raise HTTPException(status_code=429, detail="Too many investigation requests — try again later")
 
 
 def _event(db: Session, incident_id: str, type_: str, actor: str, payload: dict):
@@ -154,6 +202,20 @@ def health():
             "langgraph": _graph is not None}
 
 
+@app.get("/metrics")
+def metrics():
+    """Prometheus scrape endpoint (Phase 6).
+
+    Unauthenticated, like /api/health, so Prometheus can scrape it with no
+    credentials. It exposes ONLY aggregate counters/gauges computed from
+    the simulated services' emitted telemetry (request counts, latency
+    histogram, CPU) — no incident content, no log lines, no secrets, and
+    no memory values (memory is not measured by the simulator).
+    """
+    return PlainTextResponse(telemetry_store.prometheus_text(),
+                             media_type="text/plain; version=0.0.4")
+
+
 @app.get("/api/scenarios")
 def scenarios():
     return {"scenarios": list_scenarios(), "demo_mode": settings.demo_mode}
@@ -164,7 +226,20 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db),
           _limited: None = Depends(_rate_limit_login)):
     user = db.query(User).filter_by(email=body.email).first()
     if not user or not verify_password(body.password, user.password_hash):
+        # Audit log (never the password): failed logins are the signal
+        # for credential stuffing. The 401 message stays generic so it
+        # does not reveal whether the email exists.
+        logger.warning("Failed login attempt for %s from %s", body.email, _client_ip(request))
         raise HTTPException(status_code=401, detail="Invalid login credentials")
+    if is_legacy_hash(user.password_hash):
+        # Opportunistic upgrade: a pre–Phase 4 fixed-salt hash is
+        # re-hashed with a fresh per-user random salt on successful
+        # login, so legacy hashes disappear without a password reset.
+        # Demo logins keep working — the old hash verified just now.
+        user.password_hash = hash_password(body.password)
+        db.commit()
+        logger.info("Upgraded legacy password hash for %s", user.email)
+    logger.info("Login succeeded for %s (%s) from %s", user.email, user.role, _client_ip(request))
     return {"token": create_token(user.id, user.email, user.role), "user": {"name": user.name, "email": user.email, "role": user.role}}
 
 
@@ -202,7 +277,7 @@ async def webhook(request: Request, db: Session = Depends(get_db),
         return {"incident_id": existing.id, "deduplicated": True, **incident_out(existing)}
     inc = Incident(title=body.title, service=body.service, severity=body.severity, source=body.source, external_id=ext)
     db.add(inc); db.commit(); db.refresh(inc)
-    _event(db, inc.id, "alert", body.source, {"title": body.title, "service": body.service, "severity": body.severity})
+    _event(db, inc.id, "alert", body.source, {"title": redact_pii(body.title), "service": body.service, "severity": body.severity})
     enqueue_investigation(inc.id)  # background worker queue (Phase 4)
     return {"incident_id": inc.id, "deduplicated": False, **incident_out(inc)}
 
@@ -261,9 +336,13 @@ async def _webhook_alertmanager(payload: dict, db: Session) -> dict:
         inc = Incident(title=title, service=service, severity=severity,
                        source="alertmanager", external_id=ext, scenario="")
         db.add(inc); db.commit(); db.refresh(inc)
+        # Alert annotations are untrusted external text — redact PII /
+        # secrets before they land in the audit trail (the incident
+        # title itself is kept as-is for display; the event payload is
+        # the copy that gets redacted).
         _event(db, inc.id, "alert", "alertmanager",
-               {"title": title, "service": service, "severity": severity,
-                "alertname": labels.get("alertname", ""), "description": description,
+               {"title": redact_pii(title), "service": service, "severity": severity,
+                "alertname": labels.get("alertname", ""), "description": redact_pii(description),
                 "fingerprint": alert.fingerprint or ""})
         enqueue_investigation(inc.id)  # background worker queue (Phase 4)
         created_ids.append(inc.id)
@@ -296,12 +375,22 @@ async def integrations_status():
             prom_reachable = (await client.health())["reachable"]
         except Exception:
             prom_reachable = False
+    # Phase 6 — which metrics provider the agents actually read: the
+    # embedded telemetry store when no external Prometheus URL is set
+    # ("embedded"), else the external Prometheus ("prometheus"). The
+    # configured/reachable fields keep their original meaning (an
+    # external Prometheus URL is set / reachable).
+    try:
+        prom_provider = getattr(get_prometheus_client(), "source", "prometheus") or "prometheus"
+    except Exception:
+        prom_provider = "prometheus" if prom_configured else "embedded"
     try:
         logs_provider = get_log_provider().provider_name
     except Exception:
         logs_provider = "none"
     return {
-        "prometheus": {"configured": prom_configured, "reachable": prom_reachable, "url": prom_url},
+        "prometheus": {"configured": prom_configured, "reachable": prom_reachable, "url": prom_url,
+                       "provider": prom_provider},
         "logs": {"provider": logs_provider, "configured": logs_provider != "none"},
         "grafana": grafana_status(),
         "jira": jira_status(),
@@ -315,13 +404,19 @@ async def integrations_status():
 
 
 @app.post("/api/simulate")
-async def simulate(body: SimulateIn, db: Session = Depends(get_db)):
+async def simulate(body: SimulateIn, request: Request, db: Session = Depends(get_db),
+                   _limited: None = Depends(_rate_limit_investigate)):
     sc = get_scenario(body.scenario)
     inc = Incident(title=sc["title"], service=sc["service"], severity=sc["severity"], source="simulator",
                    external_id=f"sim-{uuid.uuid4().hex[:8]}", scenario=body.scenario)
     db.add(inc); db.commit(); db.refresh(inc)
     SERVICE_STATE.setdefault(sc["service"], {})["error_rate"] = sc["metrics"]["error_rate"]
     _event(db, inc.id, "alert", "simulator", {"title": sc["title"], "scenario": body.scenario})
+    # Phase 6 — emit the simulated service's telemetry BEFORE the
+    # investigation runs, tagged with this incident's external_id (the
+    # run_id the agents scope their reads to). Only the scenario's logs
+    # and metrics are emitted — never its root cause / remediation.
+    emit_scenario_telemetry(sc, inc.external_id)
     result = await run_investigation(db, inc)
     return {"incident_id": inc.id, "investigation": result, **incident_out(inc)}
 
@@ -405,7 +500,8 @@ async def notify(incident_id: str, body: NotifyIn, db: Session = Depends(get_db)
 
 
 @app.post("/api/incidents/{incident_id}/investigate")
-async def investigate(incident_id: str, db: Session = Depends(get_db)):
+async def investigate(incident_id: str, request: Request, db: Session = Depends(get_db),
+                      _limited: None = Depends(_rate_limit_investigate)):
     inc = db.query(Incident).filter_by(id=incident_id).first()
     if not inc:
         raise HTTPException(status_code=404, detail="Incident not found")
@@ -434,6 +530,12 @@ def approve(plan_id: str, db: Session = Depends(get_db), user: dict = Depends(_r
         raise HTTPException(status_code=404, detail="Plan not found")
     if plan.status != "pending":
         raise HTTPException(status_code=400, detail=f"Plan is {plan.status}, cannot approve")
+    if plan.expires_at and plan.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+        # An expired plan must be re-proposed, not approved: execute
+        # would refuse it anyway, so approving it would be incoherent.
+        plan.status = "expired"
+        db.commit()
+        raise HTTPException(status_code=400, detail="Plan expired — execution refused, re-approval required")
     plan.status = "approved"; plan.approved_by = user["email"]; plan.approved_at = datetime.now(timezone.utc)
     db.commit()
     _event(db, plan.incident_id, "approval", user["email"], {"message": f"Plan approved by {user['email']}", "plan_id": plan.id})
@@ -448,6 +550,10 @@ def reject(plan_id: str, body: RejectIn, db: Session = Depends(get_db), user: di
     plan = db.query(RemediationPlan).filter_by(id=plan_id).first()
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
+    if plan.status not in ("pending", "draft"):
+        # Rejecting an approved/executed plan would flip its status
+        # while the approval/execution audit trail says otherwise.
+        raise HTTPException(status_code=400, detail=f"Plan is {plan.status}, cannot reject")
     plan.status = "rejected"; db.commit()
     _event(db, plan.incident_id, "approval", user["email"], {"message": f"Plan rejected: {body.reason}", "plan_id": plan.id})
     return {"ok": True, "plan_id": plan.id, "status": "rejected"}
@@ -470,6 +576,13 @@ def execute(plan_id: str, body: ExecuteIn, db: Session = Depends(get_db), user: 
     plan = db.query(RemediationPlan).filter_by(id=plan_id).first()
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
+    # Approval-token note: the token is enforced when supplied (a wrong
+    # token is 403), but it is NOT mandatory — the frontend never sends
+    # it, and the same admin/responder role both approves and executes,
+    # so the token is not a second factor here. The binding checks are
+    # the role gate above plus execute_plan() requiring status approved,
+    # a present token, and an unexpired plan. Making the token mandatory
+    # would need the frontend to carry it from the approve response.
     if body.approval_token and body.approval_token != plan.approval_token:
         raise HTTPException(status_code=403, detail="Invalid approval token")
     inc = db.query(Incident).filter_by(id=plan.incident_id).first()
@@ -501,12 +614,15 @@ def list_docs(db: Session = Depends(get_db)):
 def add_doc(body: DocumentIn, db: Session = Depends(get_db), user: dict = Depends(_require_role({"admin", "responder"}))):
     doc = Document(title=body.title, kind=body.kind, service=body.service, content=body.content, embedding=hash_embedding(body.content))
     db.add(doc); db.commit()
+    # No incident to attach an IncidentEvent to, so the audit trail for
+    # knowledge-base writes is the server log.
+    logger.info("Knowledge document added by %s: %s (%s)", user["email"], body.title, body.kind)
     return {"id": doc.id, "title": doc.title}
 
 
 @app.post("/api/knowledge/search")
-def knowledge(body: dict, db: Session = Depends(get_db)):
-    return search_knowledge(KnowledgeInput(query=body.get("query", ""), service=body.get("service", "")))
+def knowledge(body: KnowledgeSearchIn, db: Session = Depends(get_db)):
+    return search_knowledge(KnowledgeInput(query=body.query, service=body.service))
 
 
 @app.get("/api/evals/results")
@@ -516,7 +632,8 @@ def eval_results(db: Session = Depends(get_db)):
 
 
 @app.post("/api/evals/run")
-async def run_eval(db: Session = Depends(get_db), user: dict = Depends(_require_role({"admin"}))):
+async def run_eval(request: Request, db: Session = Depends(get_db), user: dict = Depends(_require_role({"admin"})),
+                   _limited: None = Depends(_rate_limit_investigate)):
     from evals.run_eval import run_all
     metrics = await run_all(db)
     return {"metrics": metrics}

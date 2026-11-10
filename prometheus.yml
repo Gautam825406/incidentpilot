@@ -1,14 +1,10 @@
 # Minimal Prometheus config for the optional `monitoring` compose profile.
-# It scrapes itself only. Point it at your real services by adding jobs
-# that expose Prometheus metrics, e.g.:
-#
-#   - job_name: 'checkout-api'
-#     static_configs:
-#       - targets: ['checkout-api:8000']
-#
-# IncidentPilot only needs read access: it issues GET /api/v1/query
-# (PromQL) for the metrics in backend/app/integrations/prometheus.py.
-# No recording rules or alerting rules are required for the integration.
+# It scrapes itself, and the IncidentPilot backend's /metrics endpoint
+# (Phase 6: aggregate counters from the simulated services' emitted
+# telemetry — see backend/app/telemetry.py and GET /metrics in
+# backend/app/main.py). In compose the backend is reachable as
+# `backend:8000`; when Prometheus runs outside compose, use
+# `localhost:8000` instead.
 global:
   scrape_interval: 15s
 
@@ -16,3 +12,8 @@ scrape_configs:
   - job_name: 'prometheus'
     static_configs:
       - targets: ['localhost:9090']
+
+  - job_name: 'incidentpilot-backend'
+    static_configs:
+      - targets: ['backend:8000']
+    metrics_path: /metrics

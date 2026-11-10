@@ -4,9 +4,20 @@ import Landing from "./Landing";
 
 type Any = Record<string, unknown>;
 
+type Notice = { text: string; kind: "info" | "error" | "success" } | null;
+
 function statusBadge(s: string) {
-  const cls = s === "resolved" ? "green" : s === "awaiting_approval" || s === "approved" ? "amber" : s === "abstained" ? "red" : "blue";
+  const cls =
+    s === "resolved" ? "green"
+    : s === "awaiting_approval" || s === "approved" ? "amber"
+    : s === "abstained" || s === "rejected" || s === "failed" ? "red"
+    : "blue";
   return <span className={`badge ${cls}`}>{s.replaceAll("_", " ")}</span>;
+}
+
+function severityBadge(s: string) {
+  const cls = s === "critical" || s === "high" ? "red" : s === "medium" ? "amber" : "blue";
+  return <span className={`badge ${cls}`}>{s}</span>;
 }
 
 type LiveMetrics = { errorRate?: string; cpu?: string; memory?: string; latency?: string };
@@ -74,6 +85,109 @@ function EvidenceGroup({ label, items }: { label: string; items: Any[] }) {
   );
 }
 
+/** Latency per eval case, drawn only from the run's real `metrics.per_case`
+ *  array (scenario + latency_ms). Renders nothing when the run has no per-case data. */
+function LatencyChart({ perCase }: { perCase: Any[] }) {
+  const cases = perCase.filter((c) => typeof c.latency_ms === "number");
+  if (cases.length === 0) return null;
+  const max = Math.max(...cases.map((c) => c.latency_ms as number), 1);
+  return (
+    <div className="bar-chart" role="img" aria-label={`Eval latency per case, ${cases.length} cases`}>
+      {cases.map((c) => (
+        <div key={c.scenario as string} className="bar-row">
+          <span className="bar-label">{c.scenario as string}</span>
+          <div className="bar-track">
+            <div
+              className={`bar-fill ${c.correct_top1 === false ? "miss" : ""}`}
+              style={{ width: `${Math.max(4, ((c.latency_ms as number) / max) * 100)}%` }}
+            />
+          </div>
+          <span className="bar-value">{c.latency_ms as number} ms</span>
+          <span className={`bar-result ${c.correct_top1 === false ? "bad" : "ok"}`} title={c.correct_top1 === false ? "Top-1 root cause wrong" : "Top-1 root cause correct"}>
+            {c.correct_top1 === false ? "✗" : "✓"}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** Readable summary of one stored eval run — stat cards + per-case latency chart,
+ *  all from the run's real stored metrics. Fields the run does not have are omitted. */
+function EvalRunCard({ run }: { run: Any }) {
+  const m = (run.metrics ?? {}) as Any;
+  const perCase = Array.isArray(m.per_case) ? (m.per_case as Any[]) : [];
+  const demo = m.demo_mode === true;
+  const stats: { label: string; value: string }[] = [];
+  if (typeof m.correct_top1 === "number" && typeof m.n === "number") {
+    stats.push({ label: "Exact top-1 root cause", value: `${m.correct_top1}/${m.n}` });
+  }
+  if (typeof m.semantic_correct_top1 === "number" && typeof m.semantic_top1_total === "number") {
+    stats.push({ label: "Semantic top-1 (primary)", value: `${m.semantic_correct_top1}/${m.semantic_top1_total}` });
+  }
+  if (typeof m.abstention_correct === "string") {
+    stats.push({ label: "Abstention correct", value: m.abstention_correct as string });
+  }
+  if (typeof m.evidence_coverage === "number") {
+    stats.push({ label: "Evidence coverage", value: `${Math.round((m.evidence_coverage as number) * 100)}%` });
+  }
+  if (typeof m.unsafe_actions === "number") {
+    stats.push({ label: "Unsafe actions", value: String(m.unsafe_actions) });
+  }
+  if (typeof m.median_latency_ms === "number") {
+    stats.push({ label: "Median latency", value: `${m.median_latency_ms} ms` });
+  }
+  if (typeof m.total_tokens === "number") {
+    stats.push({ label: "Total tokens", value: String(m.total_tokens) });
+  }
+  if (typeof m.total_cost_usd === "number") {
+    stats.push({ label: "Total cost", value: `$${m.total_cost_usd}` });
+  }
+  return (
+    <div className="evidence">
+      <div className="row" style={{ justifyContent: "space-between" }}>
+        <strong>{run.dataset_version as string}</strong>
+        <span className={`badge ${demo ? "amber" : "green"}`}>{demo ? "Demo-mode run" : "Live-LLM run"}</span>
+      </div>
+      <div className="muted" style={{ marginTop: 4 }}>
+        Model: {run.model as string}{typeof run.run_at === "string" && run.run_at ? ` · ${run.run_at}` : ""}
+        {demo ? " · demo-model numbers, not live-LLM results" : ""}
+      </div>
+      {stats.length > 0 && (
+        <div className="stat-grid">
+          {stats.map((s) => (
+            <div key={s.label} className="stat-card"><strong>{s.value}</strong><span>{s.label}</span></div>
+          ))}
+        </div>
+      )}
+      {perCase.length > 0 && (
+        <>
+          <h4 style={{ marginTop: 16 }}>Latency per case</h4>
+          <LatencyChart perCase={perCase} />
+        </>
+      )}
+      {perCase.length > 0 && (
+        <div className="table-scroll">
+          <table className="mini-table">
+            <thead><tr><th>Case</th><th>Status</th><th>Confidence</th><th>Top-1</th><th>Latency</th></tr></thead>
+            <tbody>
+              {perCase.map((c) => (
+                <tr key={c.scenario as string}>
+                  <td>{c.scenario as string}</td>
+                  <td>{typeof c.status === "string" ? statusBadge(c.status as string) : "—"}</td>
+                  <td>{typeof c.confidence === "number" ? `${Math.round((c.confidence as number) * 100)}%` : "—"}</td>
+                  <td>{c.correct_top1 === true ? "✓ correct" : c.correct_top1 === false ? "✗ wrong" : "—"}</td>
+                  <td>{typeof c.latency_ms === "number" ? `${c.latency_ms} ms` : "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [health, setHealth] = useState<Any | null>(null);
   const [incidents, setIncidents] = useState<Any[]>([]);
@@ -85,7 +199,8 @@ export default function App() {
   const [email, setEmail] = useState("admin@demo.local");
   const [password, setPassword] = useState("admin123");
   const [user, setUser] = useState<Any | null>(null);
-  const [msg, setMsg] = useState("");
+  const [loginBusy, setLoginBusy] = useState(false);
+  const [notice, setNotice] = useState<Notice>(null);
   const [busy, setBusy] = useState(false);
   const [view, setView] = useState<"landing" | "app">("landing");
   const [integrations, setIntegrations] = useState<Any | null>(null);
@@ -95,15 +210,32 @@ export default function App() {
   const [liveMetrics, setLiveMetrics] = useState<Record<string, LiveMetrics>>({});
   const [metricsLoading, setMetricsLoading] = useState(false);
   const metricsFetchedRef = useRef<Set<string>>(new Set());
+  // First-load boot state: the free Render backend can take 50+ s to wake up,
+  // so the console shows a "waking up" state instead of empty lists until the
+  // first load succeeds or fails. Later reloads never re-enter this state.
+  const [bootState, setBootState] = useState<"loading" | "ready" | "error">("loading");
+  const [bootError, setBootError] = useState("");
+  const firstLoadRef = useRef(true);
+  // Knowledge base documents, loaded when the tab is opened.
+  const [docs, setDocs] = useState<Any[]>([]);
+  const [docsLoading, setDocsLoading] = useState(false);
+  const [docsError, setDocsError] = useState("");
+
+  const flash = (text: string, kind: "info" | "error" | "success" = "info") =>
+    setNotice({ text, kind });
 
   const load = async () => {
+    const first = firstLoadRef.current;
     try {
       setHealth(await api.health());
       setIncidents((await api.incidents()).incidents);
       setScenarios((await api.scenarios()).scenarios);
       setEvalRuns((await api.evalResults()).runs);
+      if (first) { firstLoadRef.current = false; setBootState("ready"); }
     } catch (e) {
-      setMsg(`Backend not reachable: ${(e as Error).message}. Start backend on ${"VITE_API_URL"}.`);
+      const detail = `Backend not reachable: ${(e as Error).message}. Check VITE_API_URL — the deployed backend is https://incidentpilot-backend-lmi9.onrender.com.`;
+      if (first) { firstLoadRef.current = false; setBootState("error"); setBootError(detail); }
+      else flash(detail, "error");
     }
   };
   useEffect(() => { load(); }, []);
@@ -120,6 +252,19 @@ export default function App() {
   };
   // Fetch integrations once on entering the console (and on manual Refresh).
   useEffect(() => { if (view === "app") loadIntegrations(); }, [view]);
+
+  const loadDocs = async () => {
+    setDocsLoading(true); setDocsError("");
+    try {
+      setDocs((await api.documents()).documents);
+    } catch (e) {
+      setDocs([]);
+      setDocsError(`Could not load documents: ${(e as Error).message}`);
+    }
+    setDocsLoading(false);
+  };
+  // Load the knowledge base when the tab is opened.
+  useEffect(() => { if (tab === "knowledge") loadDocs(); }, [tab]);
 
   // Live metrics for the dashboard come only from each active incident's
   // metric evidence — fetched once per incident, never invented.
@@ -145,43 +290,61 @@ export default function App() {
     return () => { cancelled = true; };
   }, [incidents]);
 
-  const open = async (id: string) => setSelected(await api.incident(id));
-  const login = async () => {
+  const open = async (id: string) => {
     try {
-      const r = await api.login(email, password);
+      setSelected(await api.incident(id));
+    } catch (e) {
+      flash(`Could not open incident: ${(e as Error).message}`, "error");
+    }
+  };
+  const login = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!email.trim() || !password) {
+      flash("Enter your email and password to log in.", "error");
+      return;
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      flash("That email address doesn't look valid.", "error");
+      return;
+    }
+    setLoginBusy(true);
+    try {
+      const r = await api.login(email.trim(), password);
       localStorage.setItem("ip_token", r.token);
       setUser(r.user);
-      setMsg(`Logged in as ${r.user.email} (${r.user.role})`);
-    } catch (e) { setMsg(`Login failed: ${(e as Error).message}`); }
+      flash(`Logged in as ${r.user.email} (${r.user.role})`, "success");
+    } catch (err) { flash(`Login failed: ${(err as Error).message}`, "error"); }
+    setLoginBusy(false);
   };
   const simulate = async () => {
-    setBusy(true); setMsg("");
+    if (!scenario) { flash("Pick a scenario first.", "error"); return; }
+    setBusy(true); setNotice(null);
     try {
       const r = await api.simulate(scenario);
-      setMsg(`Investigation finished: ${r.investigation?.status}`);
+      flash(`Investigation finished: ${r.investigation?.status}`, "success");
       await load();
       await open(r.incident_id);
-    } catch (e) { setMsg(`Simulate failed: ${(e as Error).message}`); }
+    } catch (e) { flash(`Simulate failed: ${(e as Error).message}`, "error"); }
     setBusy(false);
   };
   const act = async (fn: () => Promise<unknown>, label: string) => {
     setBusy(true);
-    try { await fn(); setMsg(label); if (selected) await open(selected.id as string); await load(); }
-    catch (e) { setMsg(`${label} failed: ${(e as Error).message}`); }
+    try { await fn(); flash(label, "success"); if (selected) await open(selected.id as string); await load(); }
+    catch (e) { flash(`${label} failed: ${(e as Error).message}`, "error"); }
     setBusy(false);
   };
   const notifyChannel = async (channel: "jira" | "slack") => {
     if (!selected) return;
-    setNotifyBusy(channel); setMsg("");
+    setNotifyBusy(channel); setNotice(null);
     try {
       const r = await api.notify(selected.id as string, channel);
       if (channel === "jira") {
-        setMsg(r.already_linked ? `Jira issue already linked: ${r.issue_key}` : `Jira issue created: ${r.issue_key}`);
+        flash(r.already_linked ? `Jira issue already linked: ${r.issue_key}` : `Jira issue created: ${r.issue_key}`, "success");
       } else {
-        setMsg("Slack notification sent");
+        flash("Slack notification sent", "success");
       }
       await open(selected.id as string); await load();
-    } catch (e) { setMsg(`Notify via ${channel} failed: ${(e as Error).message}`); }
+    } catch (e) { flash(`Notify via ${channel} failed: ${(e as Error).message}`, "error"); }
     setNotifyBusy(null);
   };
 
@@ -194,32 +357,87 @@ export default function App() {
       <header>
         <h1>🚨 IncidentPilot</h1>
         <span className="muted">Multi-agent incident resolver — LangGraph + Groq</span>
-        {health && <span className={`badge ${health.demo_mode ? "amber" : "green"}`}>{health.demo_mode ? "Demo mode — add GROQ_API_KEY for live LLM" : `Live LLM: ${health.model}`}</span>}
+        {health
+          ? <span className={`badge ${health.demo_mode ? "amber" : "green"}`}>{health.demo_mode ? "Demo mode — add GROQ_API_KEY for live LLM" : `Live LLM: ${health.model}`}</span>
+          : <span className="badge blue">Connecting to backend…</span>}
         <span style={{ flex: 1 }} />
         <button onClick={() => setView("landing")}>← Home</button>
-        <button onClick={() => setTab("incidents")}>Incidents</button>
-        <button onClick={() => setTab("eval")}>Eval dashboard</button>
-        <button onClick={() => setTab("knowledge")}>Knowledge base</button>
+        <button onClick={() => setTab("incidents")} aria-current={tab === "incidents" ? "page" : undefined}>Incidents</button>
+        <button onClick={() => setTab("eval")} aria-current={tab === "eval" ? "page" : undefined}>Eval dashboard</button>
+        <button onClick={() => setTab("knowledge")} aria-current={tab === "knowledge" ? "page" : undefined}>Knowledge base</button>
       </header>
       <main>
-        {msg && <div className="card"><strong>{msg}</strong></div>}
+        {notice && (
+          <div className={`notice ${notice.kind}`} role="status" aria-live="polite">
+            <strong>{notice.text}</strong>
+            <button className="notice-close" onClick={() => setNotice(null)} aria-label="Dismiss message">✕</button>
+          </div>
+        )}
+        {bootState === "loading" && (
+          <div className="card boot">
+            <div className="spinner" aria-hidden="true" />
+            <h2>Waking up the backend…</h2>
+            <p className="muted">
+              The backend runs on Render's free tier and can take 50+ seconds to wake up on the
+              first request after being idle. The console will appear as soon as it answers —
+              no need to refresh.
+            </p>
+          </div>
+        )}
+        {bootState === "error" && (
+          <div className="card">
+            <h2>Backend not reachable</h2>
+            <p className="muted">{bootError}</p>
+            <p className="muted">
+              If the backend is on Render's free tier it may still be waking up — wait a minute
+              and retry.
+            </p>
+            <button
+              className="primary"
+              onClick={() => { firstLoadRef.current = true; setBootState("loading"); setBootError(""); load(); }}
+            >
+              ↻ Retry connection
+            </button>
+          </div>
+        )}
+        {bootState === "ready" && (
+        <>
         {!user && (
           <div className="card">
             <h2>Log in to approve &amp; execute</h2>
             <p className="muted">Demo: admin@demo.local / admin123 · responder@demo.local / responder123 · viewer@demo.local / viewer123. Reads work without login.</p>
-            <div className="row"><input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" /><input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" /><button className="primary" onClick={login}>Log in</button></div>
+            <form onSubmit={login} className="login-form">
+              <div className="field">
+                <label htmlFor="login-email">Email</label>
+                <input id="login-email" type="email" autoComplete="username" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="admin@demo.local" required />
+              </div>
+              <div className="field">
+                <label htmlFor="login-password">Password</label>
+                <input id="login-password" type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" required />
+              </div>
+              <button className="primary" type="submit" disabled={loginBusy}>{loginBusy ? "Logging in…" : "Log in"}</button>
+            </form>
           </div>
+        )}
+        {user && (
+          <p className="muted">Signed in as <strong>{user.email as string}</strong> ({user.role as string}) — you can approve, execute and notify.</p>
         )}
         {tab === "incidents" && (
           <>
             <div className="card">
               <h2>Simulate an alert</h2>
               <div className="row">
-                <select value={scenario} onChange={(e) => setScenario(e.target.value)}>
-                  {scenarios.map((s) => <option key={s.key as string} value={s.key as string}>{s.title as string} ({s.service as string})</option>)}
-                </select>
-                <button className="primary" disabled={busy} onClick={simulate}>{busy ? "Investigating…" : "🔥 Fire alert & investigate"}</button>
+                <div className="field grow">
+                  <label htmlFor="scenario-select">Scenario</label>
+                  <select id="scenario-select" value={scenario} onChange={(e) => setScenario(e.target.value)} disabled={scenarios.length === 0}>
+                    {scenarios.map((s) => <option key={s.key as string} value={s.key as string}>{s.title as string} ({s.service as string})</option>)}
+                  </select>
+                </div>
+                <button className="primary" disabled={busy || scenarios.length === 0} onClick={simulate} title={scenarios.length === 0 ? "Scenarios are still loading" : "Fire the alert and run the investigation"}>
+                  {busy ? "Investigating…" : "🔥 Fire alert & investigate"}
+                </button>
               </div>
+              {scenarios.length === 0 && <p className="muted">Loading scenarios…</p>}
               <p className="muted">Alert → LangGraph supervisor (Triage · Logs · Metrics · Knowledge) → evidence-linked hypotheses → plan → your approval → guarded execution → verification → postmortem. No real production action is ever taken — simulated services only.</p>
             </div>
             <div className="card">
@@ -287,7 +505,7 @@ export default function App() {
                 const cell = (v: string | undefined) => (v ? v : "—");
                 return (
                   <>
-                    <div style={{ overflowX: "auto" }}>
+                    <div className="table-scroll">
                       <table className="live-table">
                         <thead><tr><th>Incident</th><th>Service</th><th>Severity</th><th>Status</th><th>Error rate</th><th>CPU</th><th>Memory</th><th>Latency</th></tr></thead>
                         <tbody>
@@ -298,7 +516,7 @@ export default function App() {
                               <tr key={i.id as string}>
                                 <td><button onClick={() => open(i.id as string)}>{i.title as string}</button>{noMetrics && <div className="muted">No live metrics</div>}</td>
                                 <td>{i.service as string}</td>
-                                <td>{i.severity as string}</td>
+                                <td>{severityBadge(i.severity as string)}</td>
                                 <td>{statusBadge(i.status as string)}</td>
                                 <td>{cell(m.errorRate)}</td>
                                 <td>{cell(m.cpu)}</td>
@@ -333,7 +551,7 @@ export default function App() {
                 {selected && (
                   <>
                     <h3>{selected.title as string}</h3>
-                    <p>{statusBadge(selected.status as string)} <span className="muted">{selected.service as string} · tokens {(selected.total_tokens as number) ?? 0} · cost ${(selected.total_cost_usd as number) ?? 0}</span></p>
+                    <p>{statusBadge(selected.status as string)} <span className="muted">{selected.service as string} · {selected.severity as string} · tokens {(selected.total_tokens as number) ?? 0} · cost ${(selected.total_cost_usd as number) ?? 0}</span></p>
                     {(() => {
                       const mon = selected.monitoring as Any | undefined;
                       const dash = mon && typeof mon.grafana_dashboard_url === "string" && mon.grafana_dashboard_url ? (mon.grafana_dashboard_url as string) : null;
@@ -362,10 +580,10 @@ export default function App() {
                           <strong>Notifications — Jira / Slack</strong>
                           {linkedKey && <div style={{ marginTop: 6 }}>Jira issue: {linkedUrl ? <a href={linkedUrl} target="_blank" rel="noreferrer">{linkedKey} ↗</a> : linkedKey}</div>}
                           <div className="row" style={{ marginTop: 8 }}>
-                            <button disabled={busy || notifyBusy !== null || !user || !jiraConfigured || Boolean(linkedKey)} onClick={() => notifyChannel("jira")}>
+                            <button disabled={busy || notifyBusy !== null || !user || !jiraConfigured || Boolean(linkedKey)} onClick={() => notifyChannel("jira")} title={!user ? "Log in as admin/responder to notify" : !jiraConfigured ? "Jira is not configured in the backend" : linkedKey ? "A Jira issue is already linked to this incident" : "Create a Jira issue for this incident"}>
                               {notifyBusy === "jira" ? "Creating…" : linkedKey ? "Jira issue linked ✓" : "Create Jira issue"}
                             </button>
-                            <button disabled={busy || notifyBusy !== null || !user || !slackConfigured} onClick={() => notifyChannel("slack")}>
+                            <button disabled={busy || notifyBusy !== null || !user || !slackConfigured} onClick={() => notifyChannel("slack")} title={!user ? "Log in as admin/responder to notify" : !slackConfigured ? "Slack is not configured in the backend" : "Send a notification to the configured Slack channel"}>
                               {notifyBusy === "slack" ? "Sending…" : "Notify Slack"}
                             </button>
                           </div>
@@ -376,6 +594,7 @@ export default function App() {
                       );
                     })()}
                     <h4>Hypotheses</h4>
+                    {(selected.hypotheses as Any[]).length === 0 && <p className="muted">No hypotheses yet — run the investigation.</p>}
                     {(selected.hypotheses as Any[]).map((h) => (
                       <div key={h.id as string} className="evidence"><span className="conf">#{h.rank as number} — {Math.round((h.confidence as number) * 100)}% confidence</span><br />{h.statement as string}<br /><span className="muted">Evidence: {(h.evidence_ids as string[]).length} linked items · {h.status as string}</span></div>
                     ))}
@@ -399,6 +618,18 @@ export default function App() {
                         {typeof plan.risk === "string" && plan.risk ? <p className="muted">Plan risk: {plan.risk}</p> : null}
                         <p className="muted">Rollback: {plan.rollback as string}</p>
                         <p className="muted">Execution status: {plan.status as string}{plan.approved_by ? ` · approved by ${plan.approved_by as string}` : ""}{plan.expires_at ? ` · approval expires ${plan.expires_at as string}` : ""}</p>
+                        <p className="muted">
+                          Approval is a one-time token: it expires 30 minutes after approval and every
+                          step is idempotent. Dry-run walks the same steps without changing anything —
+                          use it before executing.
+                        </p>
+                        <p className="muted">
+                          {plan.status === "pending"
+                            ? "Plan is pending — approve it to allow execution, or reject it."
+                            : plan.status === "approved"
+                              ? "Plan is approved — dry-run it first, then execute."
+                              : `Plan is ${plan.status} — no further approval or execution action is available.`}
+                        </p>
                         {(() => {
                           const hyps = (((selected.hypotheses as Any[]) ?? []).slice()).sort((a, b) => (a.rank as number) - (b.rank as number));
                           const top = hyps[0];
@@ -416,24 +647,30 @@ export default function App() {
                           );
                         })()}
                         <div className="row">
-                          <button className="primary" disabled={busy || plan.status !== "pending"} onClick={() => act(() => api.approve(plan.id as string), "Plan approved — execution is now allowed")}>Approve plan</button>
-                          <button className="danger" disabled={busy || plan.status !== "pending"} onClick={() => act(() => api.reject(plan.id as string, "Not the right fix"), "Plan rejected")}>Reject</button>
-                          <button disabled={busy || plan.status !== "approved"} onClick={() => act(() => api.execute(plan.id as string, true), "Dry-run complete — nothing changed")}>Dry-run</button>
-                          <button className="primary" disabled={busy || plan.status !== "approved"} onClick={() => act(() => api.execute(plan.id as string, false), "Plan executed")}>Execute (allow-list only)</button>
+                          <button className="primary" disabled={busy || plan.status !== "pending" || !user} onClick={() => act(() => api.approve(plan.id as string), "Plan approved — execution is now allowed")} title={!user ? "Log in to approve" : plan.status !== "pending" ? `Plan is ${plan.status}, not pending` : "Approve this plan"}>Approve plan</button>
+                          <button className="danger" disabled={busy || plan.status !== "pending" || !user} onClick={() => act(() => api.reject(plan.id as string, "Not the right fix"), "Plan rejected")} title={!user ? "Log in to reject" : plan.status !== "pending" ? `Plan is ${plan.status}, not pending` : "Reject this plan"}>Reject</button>
+                          <button disabled={busy || plan.status !== "approved" || !user} onClick={() => act(() => api.execute(plan.id as string, true), "Dry-run complete — nothing changed")} title={!user ? "Log in to run a dry-run" : plan.status !== "approved" ? "Approve the plan first" : "Run the plan in dry-run mode — nothing changes"}>Dry-run</button>
+                          <button className="primary" disabled={busy || plan.status !== "approved" || !user} onClick={() => act(() => api.execute(plan.id as string, false), "Plan executed")} title={!user ? "Log in to execute" : plan.status !== "approved" ? "Approve the plan first" : "Execute the plan (allow-list only)"}>Execute (allow-list only)</button>
                           <button disabled={busy} onClick={() => act(() => api.verify(selected.id as string), "Verification checked")}>Verify recovery</button>
+                          <button disabled={busy} onClick={() => act(() => api.investigate(selected.id as string), "Investigation re-run")}>Re-run investigation</button>
                         </div>
+                        {!user && <p className="muted">Log in above to approve, reject, dry-run or execute — verification and re-investigation work without login.</p>}
                       </>
                     ) : null; })()}
                     <h4>Timeline / audit</h4>
-                    <div className="timeline">{(selected.events as Any[]).map((e) => <div key={e.id as string}><span className="pill">{e.type as string}</span> <strong>{e.actor as string}</strong> — {(e.payload as Any)?.message as string || JSON.stringify(e.payload)}</div>)}</div>
+                    {(selected.events as Any[]).length === 0
+                      ? <p className="muted">No timeline events recorded yet.</p>
+                      : <div className="timeline">{(selected.events as Any[]).map((e) => <div key={e.id as string}><span className="pill">{e.type as string}</span> <strong>{e.actor as string}</strong> — {(e.payload as Any)?.message as string || JSON.stringify(e.payload)}</div>)}</div>}
                     {selected.postmortem && <><h4>Postmortem draft</h4><div className="mono">{selected.postmortem as string}</div></>}
                     <h4>Agent runs — agent by agent</h4>
                     {((selected.agent_runs as Any[]) ?? []).length === 0 ? (
                       <p className="muted">No agent runs recorded for this incident yet.</p>
                     ) : (
-                      <table><thead><tr><th>Agent</th><th>Model</th><th>Tokens</th><th>Latency</th><th>Cost</th></tr></thead><tbody>
-                        {(selected.agent_runs as Any[]).map((r, i) => <tr key={i}><td>{r.agent as string}</td><td>{r.model as string}</td><td>{r.tokens as number}</td><td>{r.latency_ms as number} ms</td><td>${(r.cost_usd as number) ?? 0}</td></tr>)}
-                      </tbody></table>
+                      <div className="table-scroll">
+                        <table className="mini-table"><thead><tr><th>Agent</th><th>Model</th><th>Tokens</th><th>Latency</th><th>Cost</th></tr></thead><tbody>
+                          {(selected.agent_runs as Any[]).map((r, i) => <tr key={i}><td>{r.agent as string}</td><td>{r.model as string}</td><td>{r.tokens as number}</td><td>{r.latency_ms as number} ms</td><td>${(r.cost_usd as number) ?? 0}</td></tr>)}
+                        </tbody></table>
+                      </div>
                     )}
                   </>
                 )}
@@ -445,24 +682,47 @@ export default function App() {
           <div className="card">
             <h2>Evaluation dashboard</h2>
             <p className="muted">Golden-set harness (6 cases). Numbers below are from real runs stored in the backend — never invented. Unsafe-action target: 0.</p>
-            <button className="primary" disabled={busy} onClick={() => act(() => api.runEval(), "Eval run complete — see results below")}>Run eval harness (admin)</button>
+            <button className="primary" disabled={busy || !user} onClick={() => act(() => api.runEval(), "Eval run complete — see results below")} title={!user ? "Log in as admin to run the eval harness" : "Run the golden-set eval harness (admin only)"}>Run eval harness (admin)</button>
+            {!user && <p className="muted">Running the harness requires an admin login — log in above first. Stored runs are visible without login.</p>}
             {evalRuns.map((r) => (
-              <div key={r.id as string} className="evidence">
-                <strong>{r.dataset_version as string}</strong> · {r.model as string} · {r.run_at as string}
-                <div className="mono">{JSON.stringify(r.metrics, null, 2)}</div>
-              </div>
+              <EvalRunCard key={r.id as string} run={r} />
             ))}
             {evalRuns.length === 0 && <p className="muted">No eval runs yet. Run the harness, or run <code>python -m evals.run_eval</code> in backend/.</p>}
           </div>
         )}
         {tab === "knowledge" && (
           <div className="card">
-            <h2>Knowledge base — runbooks &amp; postmortems</h2>
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <h2 style={{ margin: 0 }}>Knowledge base — runbooks &amp; postmortems</h2>
+              <button disabled={docsLoading} onClick={loadDocs}>{docsLoading ? "Refreshing…" : "↻ Refresh"}</button>
+            </div>
             <p className="muted">Hybrid RAG (keyword + vector) over the seeded runbooks and postmortems. Published postmortems feed back here — the learning loop.</p>
-            <button onClick={async () => { const d = await api.documents(); setMsg(JSON.stringify(d.documents.map((x: Any) => x.title))); }}>List documents</button>
+            {docsLoading && docs.length === 0 && <p className="muted">Loading documents…</p>}
+            {docsError && <p className="muted">⚠️ {docsError}</p>}
+            {!docsLoading && !docsError && docs.length === 0 && (
+              <p className="muted">No documents yet — runbooks and postmortems appear here once seeded in the backend.</p>
+            )}
+            {docs.length > 0 && (
+              <div className="table-scroll">
+                <table className="mini-table">
+                  <thead><tr><th>Title</th><th>Kind</th><th>Service</th></tr></thead>
+                  <tbody>
+                    {docs.map((d) => (
+                      <tr key={d.id as string}>
+                        <td><strong>{d.title as string}</strong></td>
+                        <td><span className={`badge ${d.kind === "postmortem" ? "amber" : "blue"}`}>{d.kind as string}</span></td>
+                        <td>{(d.service as string) || "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
         )}
         <p className="muted">IncidentPilot v1 · Simulated services only · Jira/Slack optional via backend env (see README) · What it will not do: no unapproved execution, no deletions, no production DB writes.</p>
+        </>
+        )}
       </main>
       </>
       )}
