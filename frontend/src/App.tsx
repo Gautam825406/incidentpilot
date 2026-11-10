@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "./api";
+import Landing from "./Landing";
 
 type Any = Record<string, unknown>;
 
@@ -21,6 +22,7 @@ export default function App() {
   const [user, setUser] = useState<Any | null>(null);
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
+  const [view, setView] = useState<"landing" | "app">("landing");
 
   const load = async () => {
     try {
@@ -62,11 +64,16 @@ export default function App() {
 
   return (
     <>
+      {view === "landing" ? (
+        <Landing health={health} onEnter={() => setView("app")} />
+      ) : (
+      <>
       <header>
         <h1>🚨 IncidentPilot</h1>
         <span className="muted">Multi-agent incident resolver — LangGraph + Groq</span>
         {health && <span className={`badge ${health.demo_mode ? "amber" : "green"}`}>{health.demo_mode ? "Demo mode — add GROQ_API_KEY for live LLM" : `Live LLM: ${health.model}`}</span>}
         <span style={{ flex: 1 }} />
+        <button onClick={() => setView("landing")}>← Home</button>
         <button onClick={() => setTab("incidents")}>Incidents</button>
         <button onClick={() => setTab("eval")}>Eval dashboard</button>
         <button onClick={() => setTab("knowledge")}>Knowledge base</button>
@@ -168,6 +175,8 @@ export default function App() {
         )}
         <p className="muted">IncidentPilot v1 · Simulated services only · No Slack/Jira in v1 · What it will not do: no unapproved execution, no deletions, no production DB writes.</p>
       </main>
+      </>
+      )}
     </>
   );
 }
