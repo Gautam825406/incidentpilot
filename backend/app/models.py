@@ -37,6 +37,9 @@ class Incident(Base):
     source = Column(String, default="simulator")
     external_id = Column(String, unique=True, index=True)
     scenario = Column(String, default="")  # synthetic scenario key, "" = ad-hoc
+    # Phase 3 — Jira issue created for this incident, if any (nullable; an
+    # existing DB gains the column via add_missing_columns in database.py).
+    jira_issue_key = Column(String, nullable=True)
     opened_at = Column(DateTime, default=_now)
     resolved_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=_now)

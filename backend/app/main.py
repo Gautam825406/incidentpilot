@@ -24,11 +24,13 @@ from .config import settings
 from .database import SessionLocal, get_db, init_db
 from .executor import execute_plan, postmortem_draft, verify_recovery
 from .integrations.grafana import dashboard_url, grafana_status
+from .integrations.jira import JiraClient, JiraError, jira_status
 from .integrations.logs import get_log_provider
 from .integrations.prometheus import PrometheusClient
+from .integrations.slack import SlackClient, SlackError, get_slack_client, slack_status
 from .llm import hash_embedding
 from .models import AgentRun, Document, EvalRun, Evidence, Hypothesis, Incident, IncidentEvent, RemediationPlan, User
-from .schemas import AlertIn, AlertmanagerPayload, DocumentIn, ExecuteIn, LoginIn, PlanEditIn, RejectIn, SimulateIn, incident_out
+from .schemas import AlertIn, AlertmanagerPayload, DocumentIn, ExecuteIn, LoginIn, NotifyIn, PlanEditIn, RejectIn, SimulateIn, incident_out
 from .security import create_token, verify_password, verify_token
 from .seed import seed
 from .synthetic import SERVICE_STATE, get_scenario, list_scenarios
@@ -234,8 +236,9 @@ async def _webhook_alertmanager(payload: dict, db: Session) -> dict:
 @app.get("/api/integrations/status")
 async def integrations_status():
     """Phase 2/3/4 status: Prometheus (live health check when configured),
-    logs (configured provider, via get_log_provider), Grafana links.
-    No tokens or secrets are ever included in this response."""
+    logs (configured provider, via get_log_provider), Grafana links, Jira
+    and Slack configuration. No tokens or secrets are ever included in
+    this response."""
     prom_url = (settings.prometheus_url or "").strip() or None
     prom_configured = bool(prom_url)
     prom_reachable: bool | None = None
@@ -254,7 +257,23 @@ async def integrations_status():
         "prometheus": {"configured": prom_configured, "reachable": prom_reachable, "url": prom_url},
         "logs": {"provider": logs_provider, "configured": logs_provider != "none"},
         "grafana": grafana_status(),
+        "jira": jira_status(),
+        "slack": slack_status(),
     }
+
+
+async def _notify_slack_best_effort(event: str, incident: Incident, hypothesis: dict | None = None):
+    """Phase 3 — fire-and-forget Slack notification. Never raises and never
+    blocks the incident flow; a no-op when Slack is not configured, and a
+    failed post is swallowed the same way (the incident is the source of
+    truth, not the notification)."""
+    try:
+        client = get_slack_client()
+        if client is None:
+            return
+        await client.notify(event, incident, hypothesis=hypothesis)
+    except Exception:
+        pass
 
 
 async def _run_bg(incident_id: str):
@@ -262,7 +281,15 @@ async def _run_bg(incident_id: str):
     try:
         inc = db.query(Incident).filter_by(id=incident_id).first()
         if inc:
-            await run_investigation(db, inc)
+            result = await run_investigation(db, inc)
+            # Phase 3 — best-effort Slack notification on investigation
+            # outcome (no-op when Slack is not configured).
+            if result.get("status") == "abstained":
+                await _notify_slack_best_effort("new_incident", inc)
+            else:
+                hyps = result.get("hypotheses") or []
+                await _notify_slack_best_effort("hypothesis_ready", inc,
+                                                hypothesis=hyps[0] if hyps else None)
     finally:
         db.close()
 
@@ -295,6 +322,66 @@ def get_incident(incident_id: str, db: Session = Depends(get_db)):
     if not inc:
         raise HTTPException(status_code=404, detail="Incident not found")
     return _detail(db, inc)
+
+
+@app.post("/api/incidents/{incident_id}/notify")
+async def notify(incident_id: str, body: NotifyIn, db: Session = Depends(get_db),
+                 user: dict = Depends(_require_role({"admin", "responder"}))):
+    """Phase 3 — notify a channel about an incident (admin/responder only).
+
+    {"channel": "jira"} creates a Jira issue from the incident + top
+    hypothesis/evidence summary, links the issue key back to the incident
+    (idempotent: a second call returns the existing key, no duplicate
+    issue), and returns {"ok", "channel", "issue_key", "issue_url"}.
+    {"channel": "slack"} posts a formatted message (severity, service,
+    confidence, incident id) and returns {"ok", "channel", "delivered"}.
+
+    404 when the incident does not exist; 503 when the channel is not
+    configured; 502 when the channel is configured but the call fails
+    (bad response, timeout, unreachable). An invalid channel is a 422
+    from the NotifyIn schema.
+    """
+    inc = db.query(Incident).filter_by(id=incident_id).first()
+    if not inc:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    if body.channel == "jira":
+        if inc.jira_issue_key:
+            url = None
+            if (settings.jira_url or "").strip():
+                url = f"{settings.jira_url.rstrip('/')}/browse/{inc.jira_issue_key}"
+            return {"ok": True, "channel": "jira", "issue_key": inc.jira_issue_key,
+                    "issue_url": url, "already_linked": True}
+        client = JiraClient()
+        if not client.configured:
+            raise HTTPException(status_code=503, detail="Jira is not configured (set JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY)")
+        hyps = db.query(Hypothesis).filter_by(incident_id=inc.id).order_by(Hypothesis.rank).all()
+        ev_count = db.query(Evidence).filter_by(incident_id=inc.id).count()
+        try:
+            result = await client.create_issue(
+                inc,
+                hypotheses=[{"statement": h.statement, "confidence": h.confidence} for h in hyps],
+                evidence_summary=f"{ev_count} evidence item(s) linked" if ev_count else None)
+        except JiraError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+        inc.jira_issue_key = result["key"]
+        db.commit()
+        _event(db, inc.id, "notification", user["email"],
+               {"channel": "jira", "issue_key": result["key"], "issue_url": result["url"]})
+        return {"ok": True, "channel": "jira", "issue_key": result["key"],
+                "issue_url": result["url"], "already_linked": False}
+    client = SlackClient()
+    if not client.configured:
+        raise HTTPException(status_code=503, detail="Slack is not configured (set SLACK_WEBHOOK_URL)")
+    top = db.query(Hypothesis).filter_by(incident_id=inc.id).order_by(Hypothesis.rank).first()
+    try:
+        result = await client.notify(
+            "hypothesis_ready" if top else "new_incident", inc,
+            hypothesis={"statement": top.statement, "confidence": top.confidence} if top else None)
+    except SlackError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    _event(db, inc.id, "notification", user["email"],
+           {"channel": "slack", "delivered": True})
+    return {"ok": True, "channel": "slack", "delivered": result.get("delivered", True)}
 
 
 @app.post("/api/incidents/{incident_id}/investigate")
@@ -373,11 +460,16 @@ def execute(plan_id: str, body: ExecuteIn, db: Session = Depends(get_db), user: 
 
 
 @app.post("/api/incidents/{incident_id}/verify")
-def verify(incident_id: str, db: Session = Depends(get_db), user: dict = Depends(_require_role({"admin", "responder"}))):
+async def verify(incident_id: str, db: Session = Depends(get_db), user: dict = Depends(_require_role({"admin", "responder"}))):
     inc = db.query(Incident).filter_by(id=incident_id).first()
     if not inc:
         raise HTTPException(status_code=404, detail="Incident not found")
-    return verify_recovery(db, inc)
+    result = verify_recovery(db, inc)
+    # Phase 3 — best-effort Slack "resolved" notification (no-op when
+    # Slack is not configured; never blocks verification).
+    if result.get("passed"):
+        await _notify_slack_best_effort("resolved", inc)
+    return result
 
 
 @app.get("/api/documents")

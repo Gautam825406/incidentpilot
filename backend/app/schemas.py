@@ -1,7 +1,14 @@
 """Pydantic request/response schemas — every tool and API input is validated here."""
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+from .config import settings
+
+
+class NotifyIn(BaseModel):
+    """POST /api/incidents/{id}/notify — which channel to notify."""
+    channel: Literal["jira", "slack"]
 
 
 class LoginIn(BaseModel):
@@ -65,7 +72,14 @@ class DocumentIn(BaseModel):
 
 
 def incident_out(i) -> dict:
+    # Phase 3 — the linked Jira issue, if one was created. The URL is built
+    # from settings only when both a key and a Jira URL are present.
+    jira_key = getattr(i, "jira_issue_key", None) or None
+    jira_url = None
+    if jira_key and (settings.jira_url or "").strip():
+        jira_url = f"{settings.jira_url.rstrip('/')}/browse/{jira_key}"
     return {"id": i.id, "title": i.title, "service": i.service, "severity": i.severity,
             "status": i.status, "source": i.source, "scenario": i.scenario or "",
+            "jira_issue_key": jira_key, "jira_issue_url": jira_url,
             "opened_at": i.opened_at.isoformat() if i.opened_at else None,
             "resolved_at": i.resolved_at.isoformat() if i.resolved_at else None}

@@ -36,6 +36,19 @@ class Settings(BaseSettings):
     opensearch_url: str = ""
     opensearch_auth: str = ""
     opensearch_index: str = "logs-*"
+    # Phase 3 — Jira (optional; empty = not configured). The API token is
+    # only ever sent in the Authorization header — never logged, never
+    # included in an error message, never returned by any API.
+    jira_url: str = ""
+    jira_email: str = ""
+    jira_api_token: str = ""
+    jira_project_key: str = ""
+    jira_timeout: float = 10.0
+    # Phase 3 — Slack incoming webhook (optional; empty = not configured).
+    # The webhook URL is only ever POSTed to — never logged or returned.
+    slack_webhook_url: str = ""
+    slack_channel: str = ""
+    slack_timeout: float = 10.0
     # Phase 8 — optional shared secret for /api/webhooks/alert. Empty
     # (default) keeps the demo behaviour: the webhook is open. When set,
     # callers must send header X-Alert-Token with this value (constant-time

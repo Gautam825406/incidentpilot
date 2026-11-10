@@ -30,7 +30,9 @@ Alertmanager ──webhook──►│
                          ▼  (SIMULATED services only — see "Why remediation stays disabled")
               Verification (simulated error rate < 1%) ──► Postmortem draft
                          │
-                         └─► Grafana dashboard links (per-service URLs, no secrets)
+                         ├─► Grafana dashboard links (per-service URLs, no secrets)
+                         ├─► Jira issue — created on demand (admin/responder), severity → priority
+                         └─► Slack notification — on demand + best-effort on investigation/resolution
 ```
 
 ### Integration architecture
@@ -44,11 +46,14 @@ All real integrations are **read-only** and **optional** — with none configure
 | OpenSearch | `backend/app/integrations/logs.py` | `POST /{index}/_search` | `Authorization` header as configured | same as Elasticsearch |
 | Grafana | `backend/app/integrations/grafana.py` | — (URL building only, no HTTP) | none | per-service dashboard link from `GRAFANA_DASHBOARDS` |
 | Alertmanager | `POST /api/webhooks/alert` | inbound webhook | optional `X-Alert-Token` shared secret | firing alerts → incidents, deduped by fingerprint |
+| Jira | `backend/app/integrations/jira.py` | `POST /rest/api/3/issue`, `GET/POST /rest/api/3/issue/{key}/transitions` | Basic auth (email + API token, header only, never logged) | creates an issue per incident (severity → priority), links the key back; status transitions on demand |
+| Slack | `backend/app/integrations/slack.py` | `POST` to incoming webhook URL | webhook URL only (never logged or returned) | posts new-incident / hypothesis-ready / plan / resolved notifications (severity, service, confidence) |
 
 Notes:
 - Both HTTP clients are built with `httpx trust_env=False`, so proxy env vars (including bracketed IPv6 `NO_PROXY` entries, which otherwise raise `InvalidURL`) can never break or reroute internal integration traffic.
 - A metric/log source that returns no data reports `available: false` with an error string — the agents record one `integration_unavailable` evidence item per gap and collect nothing from that source.
 - Grafana never receives credentials and is never queried; only a link is built.
+- Jira and Slack are the exception to "read-only": they **write** (create an issue / post a message), but only when explicitly configured *and* explicitly triggered — `POST /api/incidents/{id}/notify` by an admin/responder, or a best-effort Slack post on investigation outcome / resolution that is a no-op when unconfigured and can never fail the incident flow. With nothing configured the app behaves exactly as before.
 
 ## The loop (M1–M4)
 Alert / Simulate → LangGraph supervisor (Triage · Logs · Metrics · Knowledge, in parallel) → evidence-linked ranked hypotheses → remediation plan → **human approval** → guarded executor (allow-list, dry-run, idempotency, approval token + expiry) → verification (error rate < 1%) → postmortem draft → knowledge-base feedback.
@@ -112,6 +117,14 @@ Copy `.env.example` (repo root) or `backend/.env.example` to `.env`. Never commi
 | `OPENSEARCH_AUTH` | No | *(empty)* | OpenSearch `Authorization` header value, e.g. `Basic <base64>` |
 | `OPENSEARCH_INDEX` | No | `logs-*` | Index pattern searched |
 | `ALERT_WEBHOOK_SECRET` | No | *(empty = webhook open)* | When set, `/api/webhooks/alert` requires header `X-Alert-Token: <secret>` |
+| `JIRA_URL` | No | *(empty = not configured)* | Jira Cloud base URL, e.g. `https://your-domain.atlassian.net` |
+| `JIRA_EMAIL` | No | *(empty)* | Atlassian account email for Basic auth |
+| `JIRA_API_TOKEN` | No | *(empty)* | Jira API token (header only, never logged or returned) |
+| `JIRA_PROJECT_KEY` | No | *(empty)* | Jira project key, e.g. `INC` |
+| `JIRA_TIMEOUT` | No | `10.0` | Per-request timeout (seconds) for Jira calls |
+| `SLACK_WEBHOOK_URL` | No | *(empty = not configured)* | Slack incoming-webhook URL (only ever POSTed to, never logged or returned) |
+| `SLACK_CHANNEL` | No | *(empty = webhook default)* | Channel override for Slack messages, e.g. `#incidents` |
+| `SLACK_TIMEOUT` | No | `10.0` | Per-request timeout (seconds) for Slack posts |
 | `VITE_API_URL` | Frontend only | `http://localhost:8000` | Backend base URL for the frontend (build/deploy time) |
 
 ## Prometheus setup guide
@@ -146,6 +159,20 @@ receivers:
 ## Grafana setup
 1. Set `GRAFANA_URL` and `GRAFANA_DASHBOARDS` (JSON: service → dashboard path/UID, e.g. `{"checkout-api": "d/abc123/checkout-api"}`).
 2. Incident detail responses include `monitoring.grafana_dashboard_url` for the service (or `null` when unmapped); the frontend links it from the investigation view. No Grafana credentials are involved — only a link is built.
+
+## Jira setup
+1. In Jira Cloud, create an API token for the account that will file issues (Atlassian account → Security → API tokens) and note the project key (e.g. `INC`).
+2. Set `JIRA_URL` (e.g. `https://your-domain.atlassian.net`), `JIRA_EMAIL`, `JIRA_API_TOKEN`, `JIRA_PROJECT_KEY` (`JIRA_TIMEOUT` defaults to 10 s). All four are required — with any missing, Jira reports as not configured and `POST /api/incidents/{id}/notify` returns `503`.
+3. Create an issue from the incident detail view (**Create Jira issue** button, admin/responder only) or via the API below. The issue summary is `[<severity>] <title>`, the description carries service/severity/status, the top hypothesis with confidence, and an evidence count; priority follows severity (P1 → Highest, P2 → High, P3 → Medium, P4 → Low). The created key is stored on the incident (`jira_issue_key` / `jira_issue_url` in incident responses) and a second notify call returns the existing key instead of creating a duplicate. `update_issue_status` (used by the API layer on resolution flows) moves an issue to a named status via the transitions API.
+4. Check status: `GET /api/integrations/status` → `jira.configured` / `url` / `project`. The API token is never returned. The frontend's **Monitoring Connections** panel shows the same.
+5. Retries: 5xx/timeout retried twice (3 attempts total); 4xx and bad payloads fail fast with a `502` from the notify endpoint. Jira has only been tested against mocked HTTP transports — verify against a real Jira project before trusting it in production.
+
+## Slack setup
+1. In Slack, create an incoming webhook (Slack app → Incoming Webhooks → Add New Webhook to Workspace) and copy its URL.
+2. Set `SLACK_WEBHOOK_URL` (and optionally `SLACK_CHANNEL`, e.g. `#incidents`; empty means the webhook's default channel). `SLACK_TIMEOUT` defaults to 10 s. With no webhook URL, Slack reports as not configured and notify returns `503`.
+3. Post a notification from the incident detail view (**Notify Slack** button, admin/responder only) or via the API below. Messages carry severity, service, confidence (when a hypothesis exists) and the incident id. When configured, Slack is also notified best-effort (fire-and-forget, never blocking) when an investigation finishes (hypothesis ready / new incident on abstain) and when an incident is verified resolved — a failed post is swallowed; the incident is the source of truth, not the notification.
+4. Check status: `GET /api/integrations/status` → `slack.configured` / `channel`. The webhook URL is never returned. The frontend's **Monitoring Connections** panel shows the same.
+5. Retries: 5xx/timeout retried twice; a non-`ok` response fails fast. Slack has only been tested against mocked HTTP transports — verify against a real workspace before trusting it in production.
 
 ## API documentation
 
@@ -196,9 +223,29 @@ curl localhost:8000/api/integrations/status
 ```json
 {"prometheus": {"configured": false, "reachable": null, "url": null},
  "logs": {"provider": "none", "configured": false},
- "grafana": {"configured": false, "url": null}}
+ "grafana": {"configured": false, "url": null},
+ "jira": {"configured": false, "url": null, "project": null},
+ "slack": {"configured": false, "channel": null}}
 ```
 `reachable` is a live health check (capped at 5 s) when Prometheus is configured, `null` when it is not. No tokens or secrets are ever included.
+
+### `POST /api/incidents/{id}/notify` — Jira / Slack (auth required, admin/responder)
+```bash
+curl -X POST localhost:8000/api/incidents/$INCIDENT_ID/notify -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"channel": "jira"}'
+```
+```json
+{"ok": true, "channel": "jira", "issue_key": "INC-42",
+ "issue_url": "https://your-domain.atlassian.net/browse/INC-42", "already_linked": false}
+```
+```bash
+curl -X POST localhost:8000/api/incidents/$INCIDENT_ID/notify -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"channel": "slack"}'
+```
+```json
+{"ok": true, "channel": "slack", "delivered": true}
+```
+`{"channel": "jira"}` creates a Jira issue (severity → priority) and links the key back to the incident — a second call returns the existing key with `"already_linked": true` instead of a duplicate. `{"channel": "slack"}` posts the incident summary to the configured channel. Errors: `404` unknown incident, `401`/`403` auth/role, `422` invalid channel (must be `"jira"` or `"slack"`), `503` channel not configured, `502` channel configured but the call failed (bad response / timeout / unreachable).
 
 ### `GET /api/incidents/{id}` — detail (hypotheses, evidence, events, plan, monitoring)
 ```json
@@ -249,12 +296,12 @@ Full per-case table: `backend/evals/results.json`. These are demo-mode numbers, 
 
 ## Testing
 ```bash
-cd backend && .venv/bin/python -m pytest tests -q   # 52 tests, all mocked — no real infra needed
+cd backend && .venv/bin/python -m pytest tests -q   # 81 tests, all mocked — no real infra needed
 ```
-Coverage: API end-to-end (simulate → approve → dry-run → execute → verify), executor allow-list/idempotency, tools, log providers (parse / zero-hits / connection failure / invalid shape / 5xx retry / grouping), Prometheus (health success / connection failure / invalid response / timeout / missing metric), Alertmanager webhook (valid / duplicate fingerprint / invalid 422 / resolved skipped / legacy shape / optional shared secret), integrations status, live-mode Groq-down guard, confidence threshold, and the schema migration (old-DB file gains the Phase 6 columns).
+Coverage: API end-to-end (simulate → approve → dry-run → execute → verify), executor allow-list/idempotency, tools, log providers (parse / zero-hits / connection failure / invalid shape / 5xx retry / grouping), Prometheus (health success / connection failure / invalid response / timeout / missing metric), Alertmanager webhook (valid / duplicate fingerprint / invalid 422 / resolved skipped / legacy shape / optional shared secret), integrations status, live-mode Groq-down guard, confidence threshold, the schema migration (old-DB file gains the Phase 6 columns), and Phase 3 Jira/Slack (create success + priority mapping, missing config, invalid response, 4xx fail-fast, timeout/5xx retry, status transitions, Slack post success/failure/timeout, message content, notify endpoint auth/role/404/422/503/502, idempotent re-notify, status endpoint includes jira/slack with no secrets).
 
 ## Known limitations
-- **No live integration testing yet.** Prometheus, Elasticsearch/OpenSearch, Grafana and Alertmanager have been tested only against mocked HTTP transports in this environment. Nothing here claims a live Prometheus or Elasticsearch was ever connected. Wire one up and check `GET /api/integrations/status` before trusting the integrations in production.
+- **No live integration testing yet.** Prometheus, Elasticsearch/OpenSearch, Grafana, Alertmanager, Jira and Slack have been tested only against mocked HTTP transports in this environment. Nothing here claims a live Prometheus, Elasticsearch, Jira or Slack was ever connected. Wire one up and check `GET /api/integrations/status` before trusting the integrations in production.
 - **Real-mode deterministic-fallback misattribution (guarded in Phase 8, read this).** When Groq is down in live mode, the supervisor used to fall back to deterministic fixture reasoning — and an ad-hoc/Alertmanager alert has no known scenario, so `get_scenario` silently substituted the checkout-oom fixture and the system could confidently blame a memory leak it never observed. Phase 8 guards this: in live mode, an alert with no known scenario now **abstains** instead of guessing from a fixture (tested). The residual risk is narrower: an *explicitly simulated known scenario* still uses the deterministic path when Groq is down — acceptable there, because the scenario was chosen, not inferred. In demo mode the fixture path is the whole point and is labelled as such.
 - **Schema migration.** `init_db()` now adds any model column missing from an existing DB file (verified against a pre–Phase 6 SQLite file). A column that is `NOT NULL` with no default on a populated table is skipped rather than failing startup — that case needs a manual migration.
 - **Demo-grade auth.** JWT is hand-rolled HMAC-SHA256, passwords are PBKDF2 with a *fixed* salt, and the demo users/seed passwords are public. Fine for a portfolio demo; use a real identity provider (and bcrypt + per-user salts + rotation) in production. `JWT_SECRET` must be changed from the demo default.
@@ -268,7 +315,7 @@ Coverage: API end-to-end (simulate → approve → dry-run → execute → verif
 The executor is deliberately **simulated-only**: its four tools (`restart_service`, `rollback_deploy`, `scale_replicas`, `run_health_check`) mutate an in-memory `SERVICE_STATE` error rate, never a real service. Enabling real remediation would require, at minimum: a credentialed, audited actuator per target platform (Kubernetes, systemd, deploy pipeline) with least-privilege credentials; per-service blast-radius limits; a human approval that names the exact target; and a verified rollback for every action. None of that exists in this codebase, and bolting an unguarded `kubectl`/SSH path onto an LLM-driven loop would turn a wrong hypothesis into a production outage. So the line is: **investigate against real data (read-only), remediate only in simulation**. If real remediation is ever wanted, it belongs behind a separate, explicitly approved actuator service — not inside the agent loop.
 
 ## What it will NOT do
-No unapproved execution, no deletions, no production DB writes, no arbitrary shell commands, no real-infrastructure remediation. Simulated services only. No Slack/Jira in v1 (P2).
+No unapproved execution, no deletions, no production DB writes, no arbitrary shell commands, no real-infrastructure remediation. Simulated services only. Jira/Slack are opt-in notifications only — they never execute remediation.
 
 ## Structure
 ```
@@ -284,7 +331,7 @@ prometheus.yml  minimal Prometheus config for the optional compose `monitoring` 
 - [ ] Use Postgres (`DATABASE_URL`) — run `init_db()` once against it; existing SQLite files self-migrate missing columns, but back the DB up first.
 - [ ] Restrict CORS to your frontend origin; serve the backend behind HTTPS.
 - [ ] Set `ALERT_WEBHOOK_SECRET` and configure Alertmanager to send `X-Alert-Token`; or restrict `/api/webhooks/alert` at the reverse proxy.
-- [ ] Set the integration variables: `PROMETHEUS_URL` (+ token), `ELASTICSEARCH_URL`/`OPENSEARCH_URL`, `GRAFANA_URL` + `GRAFANA_DASHBOARDS`; verify with `GET /api/integrations/status` (configured + reachable) — do not assume.
+- [ ] Set the integration variables: `PROMETHEUS_URL` (+ token), `ELASTICSEARCH_URL`/`OPENSEARCH_URL`, `GRAFANA_URL` + `GRAFANA_DASHBOARDS`, `JIRA_URL` + `JIRA_EMAIL` + `JIRA_API_TOKEN` + `JIRA_PROJECT_KEY`, `SLACK_WEBHOOK_URL` (+ `SLACK_CHANNEL`); verify with `GET /api/integrations/status` (configured + reachable) — do not assume.
 - [ ] Confirm the guardrail: trigger an alert with no known scenario while Groq is down and confirm the run abstains.
 - [ ] Run the golden eval (`python -m evals.run_eval`) after any agent change and keep `backend/evals/results.json` labelled with the mode it ran in.
 - [ ] Keep remediation simulated-only unless a separate approved actuator service exists (see decision note above).

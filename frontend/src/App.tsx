@@ -91,6 +91,7 @@ export default function App() {
   const [integrations, setIntegrations] = useState<Any | null>(null);
   const [intLoading, setIntLoading] = useState(false);
   const [intError, setIntError] = useState("");
+  const [notifyBusy, setNotifyBusy] = useState<"jira" | "slack" | null>(null);
   const [liveMetrics, setLiveMetrics] = useState<Record<string, LiveMetrics>>({});
   const [metricsLoading, setMetricsLoading] = useState(false);
   const metricsFetchedRef = useRef<Set<string>>(new Set());
@@ -169,6 +170,20 @@ export default function App() {
     catch (e) { setMsg(`${label} failed: ${(e as Error).message}`); }
     setBusy(false);
   };
+  const notifyChannel = async (channel: "jira" | "slack") => {
+    if (!selected) return;
+    setNotifyBusy(channel); setMsg("");
+    try {
+      const r = await api.notify(selected.id as string, channel);
+      if (channel === "jira") {
+        setMsg(r.already_linked ? `Jira issue already linked: ${r.issue_key}` : `Jira issue created: ${r.issue_key}`);
+      } else {
+        setMsg("Slack notification sent");
+      }
+      await open(selected.id as string); await load();
+    } catch (e) { setMsg(`Notify via ${channel} failed: ${(e as Error).message}`); }
+    setNotifyBusy(null);
+  };
 
   return (
     <>
@@ -222,6 +237,11 @@ export default function App() {
                 const promCls = !prom.configured ? "red" : prom.reachable === true ? "green" : prom.reachable === false ? "red" : "amber";
                 const logsProvider = typeof logs.provider === "string" && logs.provider !== "none" && logs.provider !== "" ? (logs.provider as string) : null;
                 const grafUrl = typeof graf.url === "string" && graf.url ? (graf.url as string) : null;
+                const jira = (integrations.jira ?? {}) as Any;
+                const slack = (integrations.slack ?? {}) as Any;
+                const jiraUrl = typeof jira.url === "string" && jira.url ? (jira.url as string) : null;
+                const jiraProject = typeof jira.project === "string" && jira.project ? (jira.project as string) : null;
+                const slackChannel = typeof slack.channel === "string" && slack.channel ? (slack.channel as string) : null;
                 return (
                   <div className="conn-grid">
                     <div className="conn-card">
@@ -238,6 +258,16 @@ export default function App() {
                       <strong>Grafana</strong>
                       {graf.configured ? <span className="badge green">Configured</span> : <span className="badge red">Not connected</span>}
                       <div className="muted">{graf.configured && grafUrl ? <a href={grafUrl} target="_blank" rel="noreferrer">Open Grafana ↗</a> : "No Grafana URL configured"}</div>
+                    </div>
+                    <div className="conn-card">
+                      <strong>Jira</strong>
+                      {jira.configured ? <span className="badge green">Configured</span> : <span className="badge red">Not connected</span>}
+                      <div className="muted">{jira.configured ? `${jiraUrl ?? ""}${jiraProject ? ` · project ${jiraProject}` : ""}` : "No Jira configured — set JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY"}</div>
+                    </div>
+                    <div className="conn-card">
+                      <strong>Slack</strong>
+                      {slack.configured ? <span className="badge green">Configured</span> : <span className="badge red">Not connected</span>}
+                      <div className="muted">{slack.configured ? `Channel: ${slackChannel ?? "(webhook default)"}` : "No Slack webhook configured — set SLACK_WEBHOOK_URL"}</div>
                     </div>
                   </div>
                 );
@@ -319,6 +349,29 @@ export default function App() {
                             </div>
                           )}
                           <div className="muted" style={{ marginTop: 4 }}>Dashboard links are links only — Grafana does not supply the metrics shown in this console.</div>
+                        </div>
+                      );
+                    })()}
+                    {(() => {
+                      const jiraConfigured = Boolean((((integrations as Any)?.jira ?? {}) as Any).configured);
+                      const slackConfigured = Boolean((((integrations as Any)?.slack ?? {}) as Any).configured);
+                      const linkedKey = typeof selected.jira_issue_key === "string" && selected.jira_issue_key ? (selected.jira_issue_key as string) : null;
+                      const linkedUrl = typeof selected.jira_issue_url === "string" && selected.jira_issue_url ? (selected.jira_issue_url as string) : null;
+                      return (
+                        <div className="evidence">
+                          <strong>Notifications — Jira / Slack</strong>
+                          {linkedKey && <div style={{ marginTop: 6 }}>Jira issue: {linkedUrl ? <a href={linkedUrl} target="_blank" rel="noreferrer">{linkedKey} ↗</a> : linkedKey}</div>}
+                          <div className="row" style={{ marginTop: 8 }}>
+                            <button disabled={busy || notifyBusy !== null || !user || !jiraConfigured || Boolean(linkedKey)} onClick={() => notifyChannel("jira")}>
+                              {notifyBusy === "jira" ? "Creating…" : linkedKey ? "Jira issue linked ✓" : "Create Jira issue"}
+                            </button>
+                            <button disabled={busy || notifyBusy !== null || !user || !slackConfigured} onClick={() => notifyChannel("slack")}>
+                              {notifyBusy === "slack" ? "Sending…" : "Notify Slack"}
+                            </button>
+                          </div>
+                          <div className="muted" style={{ marginTop: 4 }}>
+                            {!user ? "Log in as admin/responder to notify." : !jiraConfigured && !slackConfigured ? "Jira and Slack are not configured — set them in the backend .env to enable notifications." : !jiraConfigured ? "Jira not configured." : !slackConfigured ? "Slack not configured." : "Notifications go to the configured Jira project / Slack channel."}
+                          </div>
                         </div>
                       );
                     })()}
@@ -409,7 +462,7 @@ export default function App() {
             <button onClick={async () => { const d = await api.documents(); setMsg(JSON.stringify(d.documents.map((x: Any) => x.title))); }}>List documents</button>
           </div>
         )}
-        <p className="muted">IncidentPilot v1 · Simulated services only · No Slack/Jira in v1 · What it will not do: no unapproved execution, no deletions, no production DB writes.</p>
+        <p className="muted">IncidentPilot v1 · Simulated services only · Jira/Slack optional via backend env (see README) · What it will not do: no unapproved execution, no deletions, no production DB writes.</p>
       </main>
       </>
       )}

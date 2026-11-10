@@ -40,4 +40,6 @@ export const api = {
   runEval: () => req("/api/evals/run", { method: "POST", headers: headers() }),
   documents: () => req("/api/documents"),
   integrationsStatus: () => req("/api/integrations/status"),
+  notify: (id: string, channel: "jira" | "slack") =>
+    req(`/api/incidents/${id}/notify`, { method: "POST", headers: headers(), body: JSON.stringify({ channel }) }),
 };
