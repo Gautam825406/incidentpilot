@@ -4,16 +4,27 @@ Demo auth only: the JWT is HMAC-SHA256 via the standard library, passwords
 are PBKDF2-HMAC-SHA256. This is honest for a portfolio demo — it is NOT
 production auth (use a proper identity provider / bcrypt + rotation there).
 Prompt-injection guard: log/document text is data, never instructions.
+
+Password salts (Phase 4): NEW users get a per-user random salt, stored
+alongside the hash as ``"<hex-salt>$<hex-hash>"``. The original demo users
+were seeded with one FIXED salt and no salt in the stored value; those
+legacy hashes keep verifying (see _LEGACY_SALT) so existing demo logins
+(admin@demo.local/admin123 etc.) keep working without a password reset.
 """
 import base64
 import hashlib
 import hmac
 import json
 import re
+import secrets
 import time
 from typing import Optional
 
 from .config import settings
+
+# Fixed salt used by the original demo seed (pre–Phase 4). Kept only so
+# legacy hashes still verify. Never used for new passwords.
+_LEGACY_SALT = "incidentpilot-demo-salt"
 
 _INJECTION_PATTERNS = [
     r"ignore (all )?(previous|above) instructions",
@@ -25,12 +36,29 @@ _INJECTION_PATTERNS = [
 ]
 
 
-def hash_password(password: str, salt: str = "incidentpilot-demo-salt") -> str:
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex()
+def hash_password(password: str, salt: str | None = None) -> str:
+    """Hash a password with a per-user random salt.
+
+    Returns ``"<salt>$<hash>"`` (both hex). Pass an explicit ``salt`` only
+    for deterministic tests; production callers leave it unset so a fresh
+    random salt is generated every time.
+    """
+    if salt is None:
+        salt = secrets.token_hex(16)  # 128-bit random salt per user
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex()
+    return f"{salt}${digest}"
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    return hmac.compare_digest(hash_password(password), password_hash)
+    """Verify against both formats: new ``"salt$hash"`` and legacy
+    fixed-salt bare hex hashes (seeded demo users)."""
+    if "$" in password_hash:
+        salt, expected = password_hash.split("$", 1)
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex()
+        return hmac.compare_digest(digest, expected)
+    # Legacy: bare hex hash produced with the old fixed salt.
+    legacy = hashlib.pbkdf2_hmac("sha256", password.encode(), _LEGACY_SALT.encode(), 100_000).hex()
+    return hmac.compare_digest(legacy, password_hash)
 
 
 def _b64(data: bytes) -> str:

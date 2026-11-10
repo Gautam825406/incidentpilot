@@ -2,7 +2,7 @@
 
 > When production breaks, IncidentPilot investigates like an SRE, proves what it found with evidence, waits for human approval, executes only an allow-listed fix, and verifies recovery — then writes the postmortem.
 
-**Stack:** FastAPI · LangGraph · Groq `llama-3.3-70b-versatile` · SQLAlchemy (Postgres + pgvector-ready, SQLite demo fallback) · React + Vite + TypeScript · Docker Compose
+**Stack:** FastAPI · LangGraph · Groq `openai/gpt-oss-120b` · SQLAlchemy (Postgres + pgvector-ready, SQLite demo fallback) · React + Vite + TypeScript · Docker Compose
 
 **Score (PRD framework): 94/100.** Full PRD: `workspace/goals/generative-ai-job-search/files/incidentpilot-prd/incidentpilot-prd.docx` (in the parent workspace).
 
@@ -62,7 +62,7 @@ Alert / Simulate → LangGraph supervisor (Triage · Logs · Metrics · Knowledg
 
 | | Demo mode (no `GROQ_API_KEY`) | Real mode (`GROQ_API_KEY` set) |
 |---|---|---|
-| LLM | None — deterministic fixture reasoning, labelled `demo_mode: true` everywhere | Groq `llama-3.3-70b-versatile`; hypotheses come from the LLM over real evidence |
+| LLM | None — deterministic fixture reasoning, labelled `demo_mode: true` everywhere | Groq `openai/gpt-oss-120b`; hypotheses come from the LLM over real evidence |
 | Logs | Synthetic fixtures from `synthetic.py`, labelled `demo/synthetic` | Elasticsearch/OpenSearch via `search_logs_real`; no provider or provider down → `integration_unavailable` evidence, no log evidence |
 | Metrics | Synthetic fixtures, labelled `demo/synthetic` | Prometheus `service_metrics()`; each unavailable metric → `integration_unavailable`, no invented value |
 | Knowledge | Same hybrid RAG over seeded runbooks/postmortems | Same |
@@ -91,8 +91,21 @@ PROMETHEUS_URL=http://prometheus:9090 docker compose --profile monitoring up --b
 # Prometheus UI: http://localhost:9090. Add scrape jobs for your services in prometheus.yml.
 ```
 
+## Postgres setup (Neon / Supabase free tier)
+
+Postgres is the primary database path; SQLite is the local/demo fallback only. No code change is needed — the same SQLAlchemy models run on both (`psycopg2-binary` is in `backend/requirements.txt`).
+
+1. **Neon** (free tier): create a project at neon.tech → copy the connection string → set `DATABASE_URL=postgresql://<user>:<password>@<host>/<db>?sslmode=require` on the backend. **Supabase** (free tier): create a project → Settings → Database → copy the URI (`postgresql://postgres:<password>@db.<ref>.supabase.co:5432/postgres`) → same env var. Both free tiers are enough for this app's volume.
+2. On first start against the empty Postgres DB, `init_db()` creates all tables (and `add_missing_columns()` adds any model column a pre-existing DB lacks — same self-migration path as SQLite).
+3. Local option: `docker compose up --build` starts the `postgres` service (`pgvector/pgvector:pg16`, `incidentpilot`/`incidentpilot`, :5432) and the backend already points at it via `DATABASE_URL` in `docker-compose.yml`.
+4. Migrating existing SQLite data: back the `.db` file up first; there is no built-in SQLite→Postgres dump yet — for the demo dataset, re-seeding (`seed()` runs on startup) plus re-running scenarios is the supported path.
+
+## Background worker
+
+Webhook-triggered investigations run off the request path in an in-process worker queue (`backend/app/worker.py`): the webhook creates the incident, enqueues its id, and returns immediately with the same response shape as before; the worker runs `run_investigation` with its own DB session and the result is readable via `GET /api/incidents/{id}` (poll until `awaiting_approval`/`abstained`). `/api/simulate` stays synchronous on purpose — its contract returns the investigation inline. Trade-off, stated plainly: the queue is in-memory and single-process, so queued ids are lost on restart and it does not share work across uvicorn workers. Scale-out path is Celery + Redis with the same task interface (`enqueue_investigation(incident_id)`) — no API change needed when that lands.
+
 ## Groq — live LLM vs demo mode
-- Live: set `GROQ_API_KEY` in `backend/.env` (free tier at console.groq.com). Model: `llama-3.3-70b-versatile`.
+- Live: set `GROQ_API_KEY` in `backend/.env` (free tier at console.groq.com). Model: `openai/gpt-oss-120b`.
 - **Without a key the app still works end-to-end in DEMO MODE** — deterministic fixture-based investigation, labelled `Demo mode — add GROQ_API_KEY for live LLM` in the UI and API. It never pretends demo output is an LLM.
 
 ## Environment variable reference
@@ -102,9 +115,13 @@ Copy `.env.example` (repo root) or `backend/.env.example` to `.env`. Never commi
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `GROQ_API_KEY` | No | *(empty = demo mode)* | Groq API key; enables live LLM mode |
-| `GROQ_MODEL` | No | `llama-3.3-70b-versatile` | LLM model |
-| `DATABASE_URL` | No | `sqlite:///./incidentpilot.db` | Postgres URL in production, e.g. `postgresql://user:password@host:5432/incidentpilot` |
-| `JWT_SECRET` | Yes in prod | `demo-secret-change-me-in-production` | HMAC secret for demo JWTs — **must** be changed in production |
+| `GROQ_MODEL` | No | `openai/gpt-oss-120b` | LLM model |
+| `DATABASE_URL` | No | `sqlite:///./incidentpilot.db` | **Postgres is the primary path** — set a Postgres URL in production, e.g. `postgresql://user:password@host:5432/incidentpilot` (Neon/Supabase free tier, or the compose `postgres` service). SQLite is the local/demo fallback only. `postgres://` URLs are normalised to `postgresql://` automatically. |
+| `JWT_SECRET` | Yes in prod | `demo-secret-change-me-in-production` | HMAC secret for demo JWTs — **the app refuses to start in live mode (GROQ_API_KEY set) if this is still the demo default**; set a strong random value |
+| `CORS_ORIGINS` | No | `http://localhost:5173,http://localhost:3000,https://incidentpilot-ten.vercel.app` | Comma-separated CORS allow-list; `"*"` only when explicitly set |
+| `RATE_LIMIT_ENABLED` | No | `true` | Set `false` to disable the in-memory rate limiter |
+| `RATE_LIMIT_LOGIN_PER_MINUTE` | No | `10` | Login attempts per minute per IP (429 when exceeded) |
+| `RATE_LIMIT_WEBHOOK_PER_MINUTE` | No | `60` | Alert webhook requests per minute per IP (429 when exceeded) |
 | `PROMETHEUS_URL` | No | *(empty = not configured)* | Prometheus base URL, e.g. `http://localhost:9090` |
 | `PROMETHEUS_AUTH_TOKEN` | No | *(empty)* | Bearer token sent to Prometheus (header only, never logged) |
 | `PROMETHEUS_TIMEOUT` | No | `10.0` | Per-request timeout (seconds) for Prometheus queries |
@@ -296,16 +313,18 @@ Full per-case table: `backend/evals/results.json`. These are demo-mode numbers, 
 
 ## Testing
 ```bash
-cd backend && .venv/bin/python -m pytest tests -q   # 81 tests, all mocked — no real infra needed
+cd backend && .venv/bin/python -m pytest tests -q   # 99 tests, all mocked — no real infra needed
 ```
-Coverage: API end-to-end (simulate → approve → dry-run → execute → verify), executor allow-list/idempotency, tools, log providers (parse / zero-hits / connection failure / invalid shape / 5xx retry / grouping), Prometheus (health success / connection failure / invalid response / timeout / missing metric), Alertmanager webhook (valid / duplicate fingerprint / invalid 422 / resolved skipped / legacy shape / optional shared secret), integrations status, live-mode Groq-down guard, confidence threshold, the schema migration (old-DB file gains the Phase 6 columns), and Phase 3 Jira/Slack (create success + priority mapping, missing config, invalid response, 4xx fail-fast, timeout/5xx retry, status transitions, Slack post success/failure/timeout, message content, notify endpoint auth/role/404/422/503/502, idempotent re-notify, status endpoint includes jira/slack with no secrets).
+Coverage: API end-to-end (simulate → approve → dry-run → execute → verify), executor allow-list/idempotency, tools, log providers (parse / zero-hits / connection failure / invalid shape / 5xx retry / grouping), Prometheus (health success / connection failure / invalid response / timeout / missing metric), Alertmanager webhook (valid / duplicate fingerprint / invalid 422 / resolved skipped / legacy shape / optional shared secret), integrations status, live-mode Groq-down guard, confidence threshold, the schema migration (old-DB file gains the Phase 6 columns), Phase 3 Jira/Slack (create success + priority mapping, missing config, invalid response, 4xx fail-fast, timeout/5xx retry, status transitions, Slack post success/failure/timeout, message content, notify endpoint auth/role/404/422/503/502, idempotent re-notify, status endpoint includes jira/slack with no secrets), and Phase 4 Step 2 hardening (per-user random password salts + legacy fixed-salt hashes still verifying, CORS allow-list parsing, JWT_SECRET fail-loud validation, login/webhook rate limiting incl. 429, background worker completing a webhook investigation readable via GET, Postgres URL recognition + `postgres://` normalisation with the SQLite fallback intact). The rate limiters stay ON in tests and are reset between tests by `tests/conftest.py`; disable them entirely with `RATE_LIMIT_ENABLED=false`.
 
 ## Known limitations
 - **No live integration testing yet.** Prometheus, Elasticsearch/OpenSearch, Grafana, Alertmanager, Jira and Slack have been tested only against mocked HTTP transports in this environment. Nothing here claims a live Prometheus, Elasticsearch, Jira or Slack was ever connected. Wire one up and check `GET /api/integrations/status` before trusting the integrations in production.
 - **Real-mode deterministic-fallback misattribution (guarded in Phase 8, read this).** When Groq is down in live mode, the supervisor used to fall back to deterministic fixture reasoning — and an ad-hoc/Alertmanager alert has no known scenario, so `get_scenario` silently substituted the checkout-oom fixture and the system could confidently blame a memory leak it never observed. Phase 8 guards this: in live mode, an alert with no known scenario now **abstains** instead of guessing from a fixture (tested). The residual risk is narrower: an *explicitly simulated known scenario* still uses the deterministic path when Groq is down — acceptable there, because the scenario was chosen, not inferred. In demo mode the fixture path is the whole point and is labelled as such.
 - **Schema migration.** `init_db()` now adds any model column missing from an existing DB file (verified against a pre–Phase 6 SQLite file). A column that is `NOT NULL` with no default on a populated table is skipped rather than failing startup — that case needs a manual migration.
-- **Demo-grade auth.** JWT is hand-rolled HMAC-SHA256, passwords are PBKDF2 with a *fixed* salt, and the demo users/seed passwords are public. Fine for a portfolio demo; use a real identity provider (and bcrypt + per-user salts + rotation) in production. `JWT_SECRET` must be changed from the demo default.
-- **CORS is wide open** (`allow_origins=["*"]`) so the demo frontend works from anywhere. Restrict it to your frontend origin in production.
+- **Demo-grade auth (hardened in Phase 4, still not production auth).** JWT is hand-rolled HMAC-SHA256; passwords are PBKDF2, now with a **per-user random salt for new users** (stored as `salt$hash`), while the original demo users' fixed-salt hashes keep verifying so existing logins work. The app **refuses to start in live mode if `JWT_SECRET` is still the demo default** (demo mode only warns). Still: use a real identity provider (and bcrypt + rotation) in production, and rotate/disable the public demo seed passwords.
+- **CORS is now an allow-list** (`CORS_ORIGINS`, default localhost:5173/3000 + the production Vercel frontend); `"*"` only when explicitly set. The default still permits the deployed frontend — add any new frontend origin to `CORS_ORIGINS`.
+- **Rate limiting is in-memory and per-process.** Login is capped at 10/min/IP and the alert webhook at 60/min/IP (429 with a generic message when exceeded). It does not survive a restart and does not share state across uvicorn workers — behind a multi-worker deployment, rate-limit at the reverse proxy (or Redis) instead. Disable with `RATE_LIMIT_ENABLED=false`.
+- **Background worker is in-memory and single-process.** Queued webhook investigations are lost on restart; Celery + Redis is the documented scale-out path. `/api/simulate` is intentionally still synchronous (its contract returns the investigation inline).
 - **The alert webhook is unauthenticated by default.** Anyone who can reach it can create incidents. Set `ALERT_WEBHOOK_SECRET` (and send `X-Alert-Token`) or put the backend behind a reverse proxy that restricts the endpoint.
 - **No proctoring / no live-infrastructure safety net beyond the allow-list.** The executor only ever touches the simulated `SERVICE_STATE`; there is no real rollback/restart of anything (by design — see below).
 - **Frontend token storage.** The JWT lives in `localStorage` (standard for this demo); a stored-XSS flaw would expose it. Keep the frontend dependency tree patched.
@@ -326,10 +345,10 @@ prometheus.yml  minimal Prometheus config for the optional compose `monitoring` 
 ```
 
 ## Production deployment checklist
-- [ ] Set a strong, unique `JWT_SECRET` (and rotate the demo users' passwords or disable seeding).
+- [ ] Set a strong, unique `JWT_SECRET` (and rotate the demo users' passwords or disable seeding). **The app will refuse to start in live mode without this** — set it before deploying the Phase 4 build.
 - [ ] Set `GROQ_API_KEY` (or accept demo mode — and say so in the UI, which it does automatically).
-- [ ] Use Postgres (`DATABASE_URL`) — run `init_db()` once against it; existing SQLite files self-migrate missing columns, but back the DB up first.
-- [ ] Restrict CORS to your frontend origin; serve the backend behind HTTPS.
+- [ ] Use Postgres (`DATABASE_URL`) — Neon/Supabase free tier, or the compose `postgres` service; run `init_db()` once against it (automatic on first start); existing SQLite files self-migrate missing columns, but back the DB up first.
+- [ ] Check `CORS_ORIGINS` covers your frontend origin; serve the backend behind HTTPS. Keep the rate limits on unless your reverse proxy rate-limits already.
 - [ ] Set `ALERT_WEBHOOK_SECRET` and configure Alertmanager to send `X-Alert-Token`; or restrict `/api/webhooks/alert` at the reverse proxy.
 - [ ] Set the integration variables: `PROMETHEUS_URL` (+ token), `ELASTICSEARCH_URL`/`OPENSEARCH_URL`, `GRAFANA_URL` + `GRAFANA_DASHBOARDS`, `JIRA_URL` + `JIRA_EMAIL` + `JIRA_API_TOKEN` + `JIRA_PROJECT_KEY`, `SLACK_WEBHOOK_URL` (+ `SLACK_CHANNEL`); verify with `GET /api/integrations/status` (configured + reachable) — do not assume.
 - [ ] Confirm the guardrail: trigger an alert with no known scenario while Groq is down and confirm the run abstains.

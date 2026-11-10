@@ -6,9 +6,9 @@
 Alertmanager ──webhook──►│
   (or legacy webhook /   │   ┌─────────────── Elasticsearch / OpenSearch ──► POST /_search (read-only)
    Simulate button)     ▼   ▼
-                    FastAPI ──► Postgres/SQLite (incidents, audit, evidence)
-                         │  (async, in-process background task; Celery+Redis is the
-                         │   scale-out migration — same task interface)
+                    FastAPI ──► Postgres (primary) / SQLite (local/demo fallback)
+                         │  (in-process worker queue for webhook investigations;
+                         │   Celery+Redis is the scale-out migration — same task interface)
                          ▼
               LangGraph supervisor (MemorySaver checkpoint)
                  ├─ Triage ──► incident history + integration config
@@ -30,8 +30,10 @@ Alertmanager ──webhook──►│
 ## Decisions
 - **LangGraph supervisor, not a single ReAct agent:** state, branching, approval interrupts, resume from checkpoint.
 - **MCP-style tools:** typed Pydantic inputs, independently testable, read-only except Executor.
-- **Postgres + pgvector-ready:** embeddings stored as JSON float lists so SQLite demo and Postgres share code; swap to a `Vector` column in one migration.
-- **Groq only for LLM:** `llama-3.3-70b-versatile` via api.groq.com; demo mode is deterministic and labelled.
+- **Postgres is the primary DB path (Phase 4):** `psycopg2-binary` is in requirements.txt; `DATABASE_URL` accepts `postgresql://` and `postgres://` (normalised in `database.py`). SQLite is the local/demo fallback only — same SQLAlchemy models, zero setup, used by the default URL and the test suite. Embeddings stored as JSON float lists so SQLite demo and Postgres share code; swap to a `Vector` column in one migration. Neon/Supabase free-tier setup: see README "Postgres setup".
+- **Background worker (Phase 4):** webhook investigations run in an in-process asyncio queue (`app/worker.py` — `enqueue_investigation(incident_id)`, single consumer, own DB session per investigation, best-effort Slack notification on outcome). The webhook returns immediately with the same response shape; `/api/simulate` stays synchronous because its contract returns the investigation inline. The queue is in-memory and single-process (lost on restart, no cross-worker sharing) — Celery + Redis is the scale-out path behind the same `enqueue_investigation` interface.
+- **Security hardening (Phase 4):** new passwords get a per-user random salt stored as `salt$hash` (`security.py`); legacy fixed-salt demo hashes still verify. The app refuses to start in live mode when `JWT_SECRET` is still the demo default (`config.validate_production_settings`, env-driven at import; demo mode only warns). CORS is an env allow-list (`CORS_ORIGINS`, default localhost:5173/3000 + the production Vercel frontend; `"*"` only when explicitly set). In-memory sliding-window rate limiting on login (10/min/IP) and the alert webhook (60/min/IP), 429 with a generic message; per-process only, reset between tests by `tests/conftest.py`, disable with `RATE_LIMIT_ENABLED=false`. Auth is still demo-grade — see README "Known limitations".
+- **Groq only for LLM:** `openai/gpt-oss-120b` via api.groq.com; demo mode is deterministic and labelled.
 - **Safety:** allow-list + approval token + expiry + idempotency + dry-run + injection guard + PII redaction. Unsafe-action target: 0.
 - **Read-only, optional integrations:** Prometheus (GET only), Elasticsearch/OpenSearch (`_search` only) and Grafana (link-building only, never queried) are all opt-in via env vars. With none configured the app behaves exactly as before. A configured-but-unavailable source yields an `integration_unavailable` evidence item — values are never invented. Both HTTP clients use `httpx trust_env=False` so proxy env vars can never reroute or break internal traffic. Jira and Slack are the deliberate exception to read-only (Phase 3): they write, but only when configured *and* explicitly triggered by an admin/responder via `POST /api/incidents/{id}/notify`, plus a best-effort Slack post on investigation outcome / resolution that is a no-op when unconfigured and can never fail the incident flow.
 - **Remediation stays simulated-only:** the executor mutates an in-memory `SERVICE_STATE` error rate, never real infrastructure. Real remediation would need a separate, credentialed actuator service with per-target blast-radius limits — deliberately out of scope for the agent loop (see README "Why remediation stays disabled for real infrastructure").
@@ -55,13 +57,13 @@ pip install -r requirements.txt && cp .env.example .env
 uvicorn app.main:app --reload --port 8000
 cd frontend && npm install && npm run dev   # http://localhost:5173
 ```
-Tests: `cd backend && .venv/bin/python -m pytest tests -q` (81 tests, all mocked — no real infra). Eval: `python -m evals.run_eval` (writes `backend/evals/results.json`, demo-labelled unless a Groq key is set).
+Tests: `cd backend && .venv/bin/python -m pytest tests -q` (99 tests, all mocked — no real infra). Eval: `python -m evals.run_eval` (writes `backend/evals/results.json`, demo-labelled unless a Groq key is set).
 
 ## Docker
-`docker compose up --build` (backend :8000, frontend :5173, Postgres :5432). Optional local Prometheus under the `monitoring` profile — see `prometheus.yml` and the README Docker section; the default `up` is unchanged without the profile.
+`docker compose up --build` (backend :8000, frontend :5173, Postgres :5432 — the `postgres` service is `pgvector/pgvector:pg16` and the backend's `DATABASE_URL` already points at it). Optional local Prometheus under the `monitoring` profile — see `prometheus.yml` and the README Docker section; the default `up` is unchanged without the profile.
 
 ## Deploy (free)
-- Backend: Render free web service, `GROQ_API_KEY` + `DATABASE_URL` (Neon free Postgres) as env vars.
+- Backend: Render free web service, `GROQ_API_KEY` + `DATABASE_URL` (Neon free Postgres) as env vars. **Set a strong `JWT_SECRET` too — the Phase 4 build refuses to start in live mode with the demo default.**
 - Frontend: Vercel free, `VITE_API_URL` = Render backend URL.
 - Local demo: `docker compose up --build`.
 - Production checklist (JWT secret, CORS, webhook secret, integration verification, eval re-run): see README.

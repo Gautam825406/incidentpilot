@@ -10,7 +10,9 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -20,30 +22,73 @@ from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from .agents import build_graph, run_investigation
-from .config import settings
+from .config import settings, validate_production_settings
 from .database import SessionLocal, get_db, init_db
 from .executor import execute_plan, postmortem_draft, verify_recovery
 from .integrations.grafana import dashboard_url, grafana_status
 from .integrations.jira import JiraClient, JiraError, jira_status
 from .integrations.logs import get_log_provider
 from .integrations.prometheus import PrometheusClient
-from .integrations.slack import SlackClient, SlackError, get_slack_client, slack_status
+from .integrations.slack import SlackClient, SlackError, slack_status
 from .llm import hash_embedding
 from .models import AgentRun, Document, EvalRun, Evidence, Hypothesis, Incident, IncidentEvent, RemediationPlan, User
+from .rate_limit import RateLimiter
 from .schemas import AlertIn, AlertmanagerPayload, DocumentIn, ExecuteIn, LoginIn, NotifyIn, PlanEditIn, RejectIn, SimulateIn, incident_out
 from .security import create_token, verify_password, verify_token
 from .seed import seed
 from .synthetic import SERVICE_STATE, get_scenario, list_scenarios
 from .tools import KnowledgeInput, search_knowledge
+from .worker import enqueue_investigation, notify_slack_best_effort, worker
+
+logger = logging.getLogger(__name__)
+
+# Fail loudly at startup if a live deployment still uses the demo JWT
+# secret. Env-driven and import-time on purpose: production settings come
+# from the environment, fixed before the app starts (see config.py).
+validate_production_settings(settings)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    worker.start()  # in-process investigation queue (Phase 4)
+    yield
+
 
 app = FastAPI(title="IncidentPilot", version="1.0.0",
-              description="Multi-agent production incident resolver — LangGraph + Groq (demo mode without a key).")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+              description="Multi-agent production incident resolver — LangGraph + Groq (demo mode without a key).",
+              lifespan=lifespan)
+# CORS is an env-configured allow-list (Phase 4); "*" only when explicitly
+# set via CORS_ORIGINS. See config.py cors_origin_list.
+app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 _graph = build_graph()  # LangGraph graph with MemorySaver checkpointer (None if langgraph unavailable)
 
 init_db()
 with SessionLocal() as _db:
     seed(_db)
+
+
+# --- Rate limiting (Phase 4, in-memory sliding window) ----------------------
+# Limits are read from settings at construction; tests lower them via
+# `login_limiter.limit = N` / reset state via `login_limiter.reset()`
+# (see tests/conftest.py — the limiter stays ON in tests, reset per test).
+# Disable entirely with RATE_LIMIT_ENABLED=false. The 429 message is
+# deliberately generic: it reveals nothing about accounts or internals.
+login_limiter = RateLimiter(limit=settings.rate_limit_login_per_minute)
+webhook_limiter = RateLimiter(limit=settings.rate_limit_webhook_per_minute)
+
+
+def _client_ip(request: Request) -> str:
+    return getattr(request.client, "host", None) or "unknown"
+
+
+def _rate_limit_login(request: Request):
+    if settings.rate_limit_enabled and not login_limiter.allow(_client_ip(request)):
+        raise HTTPException(status_code=429, detail="Too many login attempts — try again later")
+
+
+def _rate_limit_webhook(request: Request):
+    if settings.rate_limit_enabled and not webhook_limiter.allow(_client_ip(request)):
+        raise HTTPException(status_code=429, detail="Too many alert requests — try again later")
 
 
 def _event(db: Session, incident_id: str, type_: str, actor: str, payload: dict):
@@ -115,7 +160,8 @@ def scenarios():
 
 
 @app.post("/api/auth/login")
-def login(body: LoginIn, db: Session = Depends(get_db)):
+def login(body: LoginIn, request: Request, db: Session = Depends(get_db),
+          _limited: None = Depends(_rate_limit_login)):
     user = db.query(User).filter_by(email=body.email).first()
     if not user or not verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid login credentials")
@@ -123,7 +169,8 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
 
 
 @app.post("/api/webhooks/alert")
-async def webhook(request: Request, db: Session = Depends(get_db)):
+async def webhook(request: Request, db: Session = Depends(get_db),
+                  _limited: None = Depends(_rate_limit_webhook)):
     """Accept both shapes (Phase 3):
     - the original AlertIn JSON {title, service, severity, source, external_id}
       — behaviour unchanged from v1;
@@ -156,7 +203,7 @@ async def webhook(request: Request, db: Session = Depends(get_db)):
     inc = Incident(title=body.title, service=body.service, severity=body.severity, source=body.source, external_id=ext)
     db.add(inc); db.commit(); db.refresh(inc)
     _event(db, inc.id, "alert", body.source, {"title": body.title, "service": body.service, "severity": body.severity})
-    asyncio.create_task(_run_bg(inc.id))
+    enqueue_investigation(inc.id)  # background worker queue (Phase 4)
     return {"incident_id": inc.id, "deduplicated": False, **incident_out(inc)}
 
 
@@ -218,7 +265,7 @@ async def _webhook_alertmanager(payload: dict, db: Session) -> dict:
                {"title": title, "service": service, "severity": severity,
                 "alertname": labels.get("alertname", ""), "description": description,
                 "fingerprint": alert.fingerprint or ""})
-        asyncio.create_task(_run_bg(inc.id))
+        enqueue_investigation(inc.id)  # background worker queue (Phase 4)
         created_ids.append(inc.id)
     if created_ids:
         return {"acknowledged": True, "deduplicated": False, "incident_id": created_ids[0],
@@ -262,36 +309,9 @@ async def integrations_status():
     }
 
 
-async def _notify_slack_best_effort(event: str, incident: Incident, hypothesis: dict | None = None):
-    """Phase 3 — fire-and-forget Slack notification. Never raises and never
-    blocks the incident flow; a no-op when Slack is not configured, and a
-    failed post is swallowed the same way (the incident is the source of
-    truth, not the notification)."""
-    try:
-        client = get_slack_client()
-        if client is None:
-            return
-        await client.notify(event, incident, hypothesis=hypothesis)
-    except Exception:
-        pass
-
-
-async def _run_bg(incident_id: str):
-    db = SessionLocal()
-    try:
-        inc = db.query(Incident).filter_by(id=incident_id).first()
-        if inc:
-            result = await run_investigation(db, inc)
-            # Phase 3 — best-effort Slack notification on investigation
-            # outcome (no-op when Slack is not configured).
-            if result.get("status") == "abstained":
-                await _notify_slack_best_effort("new_incident", inc)
-            else:
-                hyps = result.get("hypotheses") or []
-                await _notify_slack_best_effort("hypothesis_ready", inc,
-                                                hypothesis=hyps[0] if hyps else None)
-    finally:
-        db.close()
+# Background investigations now run through the in-process worker queue
+# (app/worker.py); /api/simulate below stays synchronous on purpose —
+# its contract returns the investigation inline. See worker.py docstring.
 
 
 @app.post("/api/simulate")
@@ -468,7 +488,7 @@ async def verify(incident_id: str, db: Session = Depends(get_db), user: dict = D
     # Phase 3 — best-effort Slack "resolved" notification (no-op when
     # Slack is not configured; never blocks verification).
     if result.get("passed"):
-        await _notify_slack_best_effort("resolved", inc)
+        await notify_slack_best_effort("resolved", inc)
     return result
 
 
