@@ -75,6 +75,11 @@ class Settings(BaseSettings):
     slack_webhook_url: str = ""
     slack_channel: str = ""
     slack_timeout: float = 10.0
+    # Phase 7 — per-org credential encryption (see app/crypto.py).
+    # Base64 urlsafe 32-byte Fernet key. Empty = an ephemeral key is
+    # generated at startup (demo only; credentials encrypted with it do
+    # not survive a restart). Set CREDENTIALS_ENCRYPTION_KEY in production.
+    credentials_encryption_key: str = ""
     # Phase 8 — optional shared secret for /api/webhooks/alert. Empty
     # (default) keeps the demo behaviour: the webhook is open. When set,
     # callers must send header X-Alert-Token with this value (constant-time

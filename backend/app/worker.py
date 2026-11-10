@@ -48,10 +48,17 @@ async def notify_slack_best_effort(event: str, incident: Incident, hypothesis: d
 
 
 class InvestigationWorker:
-    """One asyncio consumer task draining an in-memory queue of incident ids."""
+    """One asyncio consumer task draining an in-memory queue of incident ids.
+
+    Queue items are ``(incident_id, org_id)`` tuples (Phase 7): the org
+    travels with the enqueue call so the worker path stays org-aware.
+    The investigation itself loads the incident (which carries org_id),
+    so org_id is carried for logging / future per-org routing, not
+    re-resolved from anywhere else.
+    """
 
     def __init__(self):
-        self._queue: asyncio.Queue[str] = asyncio.Queue()
+        self._queue: asyncio.Queue[tuple] = asyncio.Queue()
         self._task: asyncio.Task | None = None
 
     @property
@@ -74,7 +81,7 @@ class InvestigationWorker:
             self._task = loop.create_task(self._consume())
         return True
 
-    def enqueue(self, incident_id: str) -> bool:
+    def enqueue(self, incident_id: str, org_id: str | None = None) -> bool:
         """Queue an investigation. Returns False if no event loop is
         running (caller is not inside an async request handler) — the
         incident still exists and can be investigated via
@@ -82,14 +89,14 @@ class InvestigationWorker:
         if not self.start():
             logger.warning("No running event loop — investigation for %s not queued", incident_id)
             return False
-        self._queue.put_nowait(incident_id)
+        self._queue.put_nowait((incident_id, org_id))
         return True
 
     async def _consume(self):
         while True:
-            incident_id = await self._queue.get()
+            incident_id, org_id = await self._queue.get()
             try:
-                await self._run_one(incident_id)
+                await self._run_one(incident_id, org_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -97,12 +104,17 @@ class InvestigationWorker:
             finally:
                 self._queue.task_done()
 
-    async def _run_one(self, incident_id: str):
+    async def _run_one(self, incident_id: str, org_id: str | None = None):
         db = SessionLocal()
         try:
             inc = db.query(Incident).filter_by(id=incident_id).first()
             if not inc:
                 return
+            # Org sanity: the queued org must match the incident's org
+            # (a mismatch means a stale/wrong enqueue — investigate
+            # anyway, the incident row is the source of truth, but log it).
+            if org_id is not None and inc.org_id is not None and inc.org_id != org_id:
+                logger.warning("Worker org mismatch for incident %s: queued org != incident org", incident_id)
             # Phase 6 — a scenario incident investigated off the request
             # path needs its telemetry too, emitted BEFORE the
             # investigation runs and tagged with the incident's
@@ -126,6 +138,10 @@ class InvestigationWorker:
 worker = InvestigationWorker()
 
 
-def enqueue_investigation(incident_id: str) -> bool:
-    """Queue a webhook-triggered investigation (see module docstring)."""
-    return worker.enqueue(incident_id)
+def enqueue_investigation(incident_id: str, org_id: str | None = None) -> bool:
+    """Queue a webhook-triggered investigation (see module docstring).
+
+    Phase 7: callers pass the incident's org_id so the worker path stays
+    org-aware; it is optional (the incident row carries org_id) for
+    backward compatibility with direct callers."""
+    return worker.enqueue(incident_id, org_id=org_id)

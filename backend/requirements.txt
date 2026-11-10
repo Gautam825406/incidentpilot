@@ -10,3 +10,4 @@ langchain-core==0.3.33
 python-multipart==0.0.20
 pytest==8.3.4
 pytest-asyncio==0.24.0
+cryptography==44.0.0  # Fernet symmetric encryption for per-org credentials (Phase 7)

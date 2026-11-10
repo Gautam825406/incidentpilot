@@ -80,12 +80,13 @@ def _b64_decode(segment: str) -> bytes:
     return base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
 
 
-def create_token(user_id: str, email: str, role: str, expires_in: int = 86400) -> str:
+def create_token(user_id: str, email: str, role: str, org_id: str | None = None, expires_in: int = 86400) -> str:
     now = int(time.time())
     header = _b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
-    payload = _b64(
-        json.dumps({"sub": user_id, "email": email, "role": role, "iat": now, "exp": now + expires_in}).encode()
-    )
+    payload_data = {"sub": user_id, "email": email, "role": role, "iat": now, "exp": now + expires_in}
+    if org_id:
+        payload_data["org_id"] = org_id
+    payload = _b64(json.dumps(payload_data).encode())
     sig = _b64(hmac.new(settings.jwt_secret.encode(), f"{header}.{payload}".encode(), hashlib.sha256).digest())
     return f"{header}.{payload}.{sig}"
 
@@ -116,9 +117,51 @@ def verify_token(token: str) -> Optional[dict]:
         exp = data.get("exp")
         if not isinstance(exp, int) or exp < time.time():
             return None
+        # Phase 7 — org_id, when present, must be a non-empty string.
+        # Tokens issued before Phase 7 have no org_id; they stay valid
+        # and callers resolve the org from the user record instead.
+        if "org_id" in data and data["org_id"] is not None:
+            if not isinstance(data["org_id"], str) or not data["org_id"]:
+                return None
         return data
     except Exception:
         return None
+
+
+def get_current_org(db, token_data: dict):
+    """Resolve the Organization for an authenticated token.
+
+    Returns the Organization, or raises an HTTPException: 404 when the
+    token carries no resolvable org (or the org no longer exists), 403
+    when the token's user is not a member of that org. Tokens without an
+    org_id (pre–Phase 7) resolve via the user's primary org / membership.
+    """
+    from fastapi import HTTPException
+
+    from .models import Organization, OrganizationMembership, User
+
+    org_id = token_data.get("org_id")
+    user = db.query(User).filter_by(id=token_data.get("sub")).first() if token_data.get("sub") else None
+    if not org_id:
+        if user is not None and user.org_id:
+            org_id = user.org_id
+        elif user is not None:
+            membership = db.query(OrganizationMembership).filter_by(user_id=user.id).first()
+            if membership is not None:
+                org_id = membership.org_id
+    if not org_id:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    org = db.query(Organization).filter_by(id=org_id).first()
+    if org is None:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    if user is not None:
+        is_member = (
+            user.org_id == org.id
+            or db.query(OrganizationMembership).filter_by(org_id=org.id, user_id=user.id).first() is not None
+        )
+        if not is_member:
+            raise HTTPException(status_code=403, detail="User is not a member of this organization")
+    return org
 
 
 def redact_pii(text: str) -> str:

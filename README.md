@@ -118,6 +118,7 @@ Copy `.env.example` (repo root) or `backend/.env.example` to `.env`. Never commi
 | `GROQ_MODEL` | No | `openai/gpt-oss-120b` | LLM model |
 | `DATABASE_URL` | No | `sqlite:///./incidentpilot.db` | **Postgres is the primary path** — set a Postgres URL in production, e.g. `postgresql://user:password@host:5432/incidentpilot` (Neon/Supabase free tier, or the compose `postgres` service). SQLite is the local/demo fallback only. `postgres://` URLs are normalised to `postgresql://` automatically. |
 | `JWT_SECRET` | Yes in prod | `demo-secret-change-me-in-production` | HMAC secret for demo JWTs — **the app refuses to start in live mode (GROQ_API_KEY set) if this is still the demo default**; set a strong random value |
+| `CREDENTIALS_ENCRYPTION_KEY` | Yes in prod | *(empty = ephemeral demo-only key, warned in logs)* | Base64 urlsafe 32-byte Fernet key used to encrypt per-organization integration credentials at rest (Phase 7 SaaS). Generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. If unset, an ephemeral key is generated at startup and encrypted credentials are unrecoverable after a restart — set it before any company stores real credentials. |
 | `CORS_ORIGINS` | No | `http://localhost:5173,http://localhost:3000,https://incidentpilot-ten.vercel.app` | Comma-separated CORS allow-list; `"*"` only when explicitly set |
 | `RATE_LIMIT_ENABLED` | No | `true` | Set `false` to disable the in-memory rate limiter |
 | `RATE_LIMIT_LOGIN_PER_MINUTE` | No | `10` | Login attempts per minute per IP (429 when exceeded) |
@@ -292,6 +293,24 @@ Other endpoints: `GET /api/incidents`, `GET /api/scenarios`, `POST /api/incident
 
 ## Demo login
 `admin@demo.local` / `admin123` · `responder@demo.local` / `responder123` · `viewer@demo.local` / `viewer123`
+
+## SaaS — multi-tenant workspaces (Phase 7, 11 Nov 2026)
+
+Any company can sign up on the website and use the AI on **their own** incidents, with **their own** monitoring credentials. One deployment, one database — every row belongs to exactly one organization, and every query is scoped to the caller's org (cross-org ids return 404, so one company cannot even learn another company's incident exists).
+
+**Company onboarding flow**
+1. A company opens the site and clicks **Create your workspace** (landing page or login page).
+2. Signup: company name + admin name/email/password (min 8 chars) → `POST /api/auth/signup` creates the Organization and its first admin user and returns a JWT carrying `org_id` + role.
+3. The admin opens **Integrations / Connect your tools** (admin only) and adds each tool's credentials for their org: Prometheus URL + token, logs provider (Elasticsearch or OpenSearch URL + API key), Grafana URL, Jira URL/email/API token/project, Slack webhook URL. Each card has a **Test connection** button (`POST /api/integrations/{name}/test`) that does a real lightweight health check and records the result.
+4. The admin copies their org's Alertmanager webhook URL from the same page (`POST /api/webhooks/alert/<org-webhook-token>`) into Alertmanager — alerts then land in their org only, deduped per org by fingerprint. The token can be rotated (`POST /api/orgs/webhook-token/rotate`, admin only; the new token is shown once, never again).
+5. The admin invites team members (**Team** view, admin only): email + role admin/responder/viewer. The same approve/reject/execute role rules apply, scoped to the org.
+6. From then on the AI works on their incidents using **their** credentials: the Logs/Metrics agents query the org's Prometheus/log provider, Grafana links point at the org's dashboards, and Jira/Slack notify uses the org's accounts. If an org has no credential for a tool, the agents fall back to the global env-var config (labelled `source: "global"` in `GET /api/integrations/status`); with neither, the integration reports `integration_unavailable` and no value is invented.
+
+**How credentials are stored.** Secrets are encrypted at rest with Fernet (`backend/app/crypto.py`, key from `CREDENTIALS_ENCRYPTION_KEY` — see env reference above); only non-secret fields (URL, project, index, channel) are stored in plaintext. No API response ever returns a secret — status endpoints return masked values only (`••••1234`). Secrets are decrypted per investigation only, never cached process-wide, never logged.
+
+**Demo org.** The seeded demo users/incidents belong to a Demo org (slug `demo`); demo login works exactly as before, and unauthenticated reads see the demo org only. The legacy global webhook (`POST /api/webhooks/alert`) still works and lands in the demo org when unauthenticated.
+
+**Known SaaS limitations (Phase 7, not built).** No billing/payments — there is no plan enforcement beyond the `plan: "free"` field, and no paid tier exists yet. No email verification — signup needs no email confirmation, and an invited brand-new user gets a random unusable password and cannot log in until a password-set/reset flow is built (inviting an *existing* user works end to end). No org-switching in the UI — a user invited into a second org still logs in under their primary org (memberships are listed in `GET /api/orgs/me`). `/api/knowledge/search` answers from the shared static runbooks/postmortems, not per-org documents. JWT still lives in `localStorage` (see Known limitations).
 
 ## Evaluation — real measured numbers
 ```bash

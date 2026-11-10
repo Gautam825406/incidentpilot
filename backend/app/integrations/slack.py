@@ -162,6 +162,50 @@ def get_slack_client() -> SlackClient | None:
     return client if client.configured else None
 
 
+def get_slack_client_for_org(db, org_id: str | None,
+                             transport: httpx.BaseTransport | None = None) -> SlackClient | None:
+    """Phase 7 — per-org Slack client.
+
+    When the org has an active ``slack`` integration with a webhook URL
+    (secrets ``webhook_url``, config ``channel``), build a client from
+    it. Otherwise fall back to the global env-configured client
+    (:func:`get_slack_client`). Returns None when neither is configured.
+    ``org_id`` None means "no org resolved": straight to the global
+    fallback. ``transport`` is a test hook (httpx.MockTransport). The
+    webhook URL is only ever POSTed to — never logged.
+    """
+    if org_id:
+        try:
+            from ..org_integrations import get_org_integration_decrypted
+            integ = get_org_integration_decrypted(db, org_id, "slack")
+        except Exception:
+            integ = None
+        if integ:
+            config = integ.get("config") or {}
+            secrets = integ.get("secrets") or {}
+            webhook_url = (secrets.get("webhook_url") or config.get("webhook_url") or "").strip()
+            if webhook_url:
+                channel = (config.get("channel") or "").strip() or None
+                return SlackClient(webhook_url=webhook_url, channel=channel,
+                                   transport=transport)
+    return get_slack_client()
+
+
+async def post_slack_for_org(db, org_id: str | None, event: str, incident,
+                             hypothesis: dict | None = None, detail: str | None = None,
+                             app_url: str | None = None,
+                             transport: httpx.BaseTransport | None = None) -> dict:
+    """Phase 7 — post a Slack notification using the incident's org
+    credentials (falling back to the global config). Raises SlackError
+    when neither is configured or the event is unknown. Same return
+    shape as :meth:`SlackClient.notify`."""
+    client = get_slack_client_for_org(db, org_id, transport=transport)
+    if client is None:
+        raise SlackError("slack is not configured (set SLACK_WEBHOOK_URL)")
+    return await client.notify(event, incident, hypothesis=hypothesis,
+                               detail=detail, app_url=app_url)
+
+
 def slack_status() -> dict:
     """Status for GET /api/integrations/status — no secrets ever.
 

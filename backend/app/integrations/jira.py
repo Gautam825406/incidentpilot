@@ -217,6 +217,54 @@ def get_jira_client() -> JiraClient | None:
     return client if client.configured else None
 
 
+def get_jira_client_for_org(db, org_id: str | None,
+                            transport: httpx.BaseTransport | None = None) -> JiraClient | None:
+    """Phase 7 — per-org Jira client.
+
+    When the org has an active ``jira`` integration with a complete
+    credential set (config ``url``/``project``, secrets ``email``/
+    ``api_token`` — ``email`` is also accepted from config), build a
+    client from it. Otherwise fall back to the global env-configured
+    client (:func:`get_jira_client`). Returns None when neither is
+    configured. An incomplete org credential set falls back to global
+    rather than mixing org and global credentials. ``org_id`` None means
+    "no org resolved": straight to the global fallback. ``transport`` is
+    a test hook (httpx.MockTransport). The token is only ever sent in
+    the Authorization header — never logged.
+    """
+    if org_id:
+        try:
+            from ..org_integrations import get_org_integration_decrypted
+            integ = get_org_integration_decrypted(db, org_id, "jira")
+        except Exception:
+            integ = None
+        if integ:
+            config = integ.get("config") or {}
+            secrets = integ.get("secrets") or {}
+            url = (config.get("url") or config.get("base_url") or "").strip()
+            project = (config.get("project") or config.get("project_key") or "").strip()
+            email = (secrets.get("email") or config.get("email") or "").strip()
+            token = (secrets.get("api_token") or secrets.get("token") or "").strip()
+            if url and project and email and token:
+                return JiraClient(base_url=url, email=email, api_token=token,
+                                  project_key=project, transport=transport)
+    return get_jira_client()
+
+
+async def create_jira_issue_for_org(db, org_id: str | None, incident,
+                                    hypotheses: list | None = None,
+                                    evidence_summary: str | None = None,
+                                    transport: httpx.BaseTransport | None = None) -> dict:
+    """Phase 7 — create a Jira issue using the incident's org credentials
+    (falling back to the global config). Raises JiraError when neither
+    is configured. Same return shape as
+    :meth:`JiraClient.create_issue`."""
+    client = get_jira_client_for_org(db, org_id, transport=transport)
+    if client is None:
+        raise JiraError("jira is not configured (set JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY)")
+    return await client.create_issue(incident, hypotheses, evidence_summary)
+
+
 def jira_status() -> dict:
     """Status for GET /api/integrations/status — no secrets ever.
 

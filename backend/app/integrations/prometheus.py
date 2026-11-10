@@ -37,10 +37,11 @@ def _escape_label(value: str) -> str:
 
 class PrometheusClient:
     def __init__(self, base_url: str | None = None, auth_token: str | None = None,
-                 timeout: float | None = None):
+                 timeout: float | None = None, transport: httpx.BaseTransport | None = None):
         self.base_url = (base_url if base_url is not None else settings.prometheus_url).rstrip("/")
         self._auth_token = auth_token if auth_token is not None else settings.prometheus_auth_token
         self.timeout = float(timeout if timeout is not None else settings.prometheus_timeout)
+        self._transport = transport
 
     def _headers(self) -> dict:
         # Token only ever goes into the header; never logged or echoed.
@@ -54,7 +55,10 @@ class PrometheusClient:
         # proxy env parsing itself can fail (httpx.InvalidURL on bracketed
         # IPv6 no_proxy entries). A bad configured URL is a clean error.
         try:
-            client = httpx.AsyncClient(timeout=self.timeout, trust_env=False)
+            kwargs: dict = {"timeout": self.timeout, "trust_env": False}
+            if self._transport is not None:
+                kwargs["transport"] = self._transport
+            client = httpx.AsyncClient(**kwargs)
         except httpx.InvalidURL:
             raise PrometheusError("invalid Prometheus URL configured") from None
         async with client:
@@ -283,3 +287,41 @@ def get_prometheus_client() -> PrometheusClient | EmbeddedPrometheusClient | Non
     if not settings.prometheus_url or not settings.prometheus_url.strip():
         return EmbeddedPrometheusClient()
     return PrometheusClient()
+
+
+def get_prometheus_client_for_org(db, org_id: str | None,
+                                  transport: httpx.BaseTransport | None = None) -> PrometheusClient | EmbeddedPrometheusClient | None:
+    """Phase 7 — per-org Prometheus client.
+
+    When the org has an active ``prometheus`` integration, build a client
+    from its config (``url``) + secrets (``token``, falling back to
+    ``api_key``). Otherwise fall back to the global settings-based client
+    (:func:`get_prometheus_client`, which is the external Prometheus when
+    PROMETHEUS_URL is set, else the Phase 6 embedded client). Returns
+    None only when the global client is None (defensive — in practice
+    the embedded client is always available, so the None branch is
+    unreachable; returning None here when no external URL is set would
+    break the Phase 6 embedded metrics path the agents rely on). The
+    token is only ever sent in the Authorization header — never logged.
+    ``org_id`` None means "no org resolved": straight to the global
+    fallback. ``transport`` is a test hook (httpx.MockTransport).
+    """
+    if org_id:
+        try:
+            from ..org_integrations import get_org_integration_decrypted
+            integ = get_org_integration_decrypted(db, org_id, "prometheus")
+        except Exception:
+            integ = None
+        if integ:
+            config = integ.get("config") or {}
+            secrets = integ.get("secrets") or {}
+            url = (config.get("url") or config.get("base_url") or "").strip()
+            token = (secrets.get("token") or secrets.get("api_key") or "").strip()
+            if url:
+                return PrometheusClient(base_url=url, auth_token=token or None,
+                                        transport=transport)
+    client = get_prometheus_client()
+    if transport is not None and isinstance(client, PrometheusClient):
+        # Test hook only: a mocked transport for the global client too.
+        client._transport = transport
+    return client

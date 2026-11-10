@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { api } from "./api";
+import { api, getOrg, getStoredUser, saveAuth, clearAuth, API_URL } from "./api";
+import type { AuthResponse, Member, Org, OrgIntegration, OrgMe } from "./api";
 import Landing from "./Landing";
 
 type Any = Record<string, unknown>;
@@ -188,6 +189,767 @@ function EvalRunCard({ run }: { run: Any }) {
   );
 }
 
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/** Strip the "404: " status prefix the api client adds, for inline display. */
+function errText(e: unknown): string {
+  const m = e instanceof Error ? e.message : String(e);
+  return m.replace(/^\d{3}: /, "");
+}
+
+const INTEGRATION_NAMES = ["prometheus", "logs", "grafana", "jira", "slack"] as const;
+type IntegName = (typeof INTEGRATION_NAMES)[number];
+
+export type StatusEntry = {
+  configured: boolean;
+  provider: string;
+  masked_url: string | null;
+  last_test_ok: boolean | null;
+  source: "org" | "global" | "none";
+};
+
+/**
+ * Normalise GET /api/integrations/status into one entry per integration.
+ * Accepts the Phase 7 per-org shape (an array, or {integrations: [...]},
+ * each entry {name, configured, provider, masked_url, last_test_ok,
+ * source: "org"|"global"|"none"}) AND the pre-Phase-7 global map shape
+ * ({prometheus: {configured, reachable, url, provider}, logs: {provider,
+ * configured}, grafana/jira/slack: {configured, url, ...}}) — the backend
+ * still returns the old shape until Worker B lands, so both must render.
+ * A per-org entry without a source is attributed to the workspace when a
+ * per-org row exists, else to the global config.
+ */
+function normalizeStatus(raw: unknown, orgConfigured: Set<string>): Record<IntegName, StatusEntry> {
+  const out = {} as Record<IntegName, StatusEntry>;
+  for (const n of INTEGRATION_NAMES) {
+    out[n] = { configured: false, provider: "", masked_url: null, last_test_ok: null, source: "none" };
+  }
+  if (!raw || typeof raw !== "object") return out;
+  const list: Any[] = Array.isArray(raw)
+    ? (raw as Any[])
+    : Array.isArray((raw as Any).integrations)
+      ? ((raw as Any).integrations as Any[])
+      : [];
+  if (list.length > 0) {
+    for (const e of list) {
+      const name = String(e.name ?? "");
+      if (!(INTEGRATION_NAMES as readonly string[]).includes(name)) continue;
+      const configured = e.configured === true;
+      const source =
+        e.source === "org" || e.source === "global" || e.source === "none"
+          ? (e.source as StatusEntry["source"])
+          : configured
+            ? orgConfigured.has(name)
+              ? "org"
+              : "global"
+            : "none";
+      out[name as IntegName] = {
+        configured,
+        provider: typeof e.provider === "string" ? e.provider : "",
+        masked_url: typeof e.masked_url === "string" ? e.masked_url : null,
+        last_test_ok: typeof e.last_test_ok === "boolean" ? e.last_test_ok : null,
+        source,
+      };
+    }
+    return out;
+  }
+  // Legacy global map shape.
+  const map = raw as Record<string, Any>;
+  for (const n of INTEGRATION_NAMES) {
+    const e = map[n];
+    if (!e || typeof e !== "object") continue;
+    let configured = e.configured === true;
+    if (n === "logs" && typeof e.provider === "string") {
+      configured = configured || (e.provider !== "none" && e.provider !== "");
+    }
+    out[n] = {
+      configured,
+      provider: typeof e.provider === "string" ? e.provider : "",
+      masked_url:
+        typeof e.masked_url === "string" ? e.masked_url : typeof e.url === "string" ? e.url : null,
+      last_test_ok: typeof e.last_test_ok === "boolean" ? e.last_test_ok : null,
+      source: configured ? "global" : "none",
+    };
+  }
+  return out;
+}
+
+function statusLabel(s: StatusEntry): string {
+  if (!s.configured) return "Not configured";
+  if (s.source === "org") return "Configured via your workspace";
+  if (s.source === "global") return "Configured globally";
+  return "Configured";
+}
+
+const INTEGRATION_META: Record<
+  IntegName,
+  {
+    label: string;
+    blurb: string;
+    configFields: { key: string; label: string; placeholder?: string }[];
+    secretFields: { key: string; label: string }[];
+    providerOptions?: string[];
+  }
+> = {
+  prometheus: {
+    label: "Prometheus",
+    blurb: "Metrics source the investigation agents read.",
+    configFields: [{ key: "url", label: "Prometheus URL", placeholder: "http://localhost:9090" }],
+    secretFields: [{ key: "token", label: "Bearer token" }],
+  },
+  logs: {
+    label: "Logs",
+    blurb: "Log provider the investigation agents read.",
+    providerOptions: ["elasticsearch", "opensearch"],
+    configFields: [
+      { key: "url", label: "Logs URL", placeholder: "http://localhost:9200" },
+      { key: "index", label: "Index", placeholder: "logs-*" },
+    ],
+    secretFields: [
+      { key: "api_key", label: "API key" },
+      { key: "token", label: "Token" },
+    ],
+  },
+  grafana: {
+    label: "Grafana",
+    blurb: "Dashboard links shown on incidents.",
+    configFields: [{ key: "url", label: "Grafana URL", placeholder: "http://localhost:3000" }],
+    secretFields: [{ key: "api_key", label: "API key" }],
+  },
+  jira: {
+    label: "Jira",
+    blurb: "Creates issues from incidents (Notify → Jira).",
+    configFields: [
+      { key: "url", label: "Jira URL", placeholder: "https://your-team.atlassian.net" },
+      { key: "project", label: "Project key", placeholder: "OPS" },
+      { key: "email", label: "Account email" },
+    ],
+    secretFields: [{ key: "api_token", label: "API token" }],
+  },
+  slack: {
+    label: "Slack",
+    blurb: "Sends incident notifications (Notify → Slack).",
+    configFields: [{ key: "channel", label: "Channel", placeholder: "#incidents" }],
+    secretFields: [{ key: "webhook_url", label: "Incoming webhook URL" }],
+  },
+};
+
+type IntegForm = { config: Record<string, string>; secrets: Record<string, string>; provider: string };
+const EMPTY_FORM: IntegForm = { config: {}, secrets: {}, provider: "" };
+
+function SignupView({
+  onAuthed,
+  onLogin,
+  onHome,
+}: {
+  onAuthed: (r: AuthResponse) => void;
+  onLogin: () => void;
+  onHome: () => void;
+}) {
+  const [company, setCompany] = useState("");
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [serverError, setServerError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const errs: Record<string, string> = {};
+    if (!company.trim()) errs.company = "Enter your company name.";
+    if (!name.trim()) errs.name = "Enter your name.";
+    if (!EMAIL_RE.test(email.trim())) errs.email = "Enter a valid email address.";
+    if (password.length < 8) errs.password = "Password must be at least 8 characters.";
+    if (confirm !== password) errs.confirm = "Passwords do not match.";
+    setErrors(errs);
+    setServerError("");
+    if (Object.keys(errs).length > 0) return;
+    setBusy(true);
+    try {
+      const r = (await api.signup(company.trim(), name.trim(), email.trim(), password)) as AuthResponse;
+      onAuthed(r);
+    } catch (err) {
+      setServerError(errText(err));
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div className="auth-wrap">
+      <div className="card">
+        <h2>Create your workspace</h2>
+        <p className="muted">
+          One workspace per company — your incidents, team and connected tools stay separate
+          from every other company and from the demo. You become the workspace admin.
+        </p>
+        <form onSubmit={submit} noValidate>
+          <div className="form-grid">
+            <div className="field">
+              <label htmlFor="signup-company">Company name</label>
+              <input id="signup-company" autoComplete="organization" value={company} onChange={(e) => setCompany(e.target.value)} placeholder="Acme Inc" />
+              {errors.company && <span className="field-error">{errors.company}</span>}
+            </div>
+            <div className="field">
+              <label htmlFor="signup-name">Your name</label>
+              <input id="signup-name" autoComplete="name" value={name} onChange={(e) => setName(e.target.value)} placeholder="Ada Lovelace" />
+              {errors.name && <span className="field-error">{errors.name}</span>}
+            </div>
+          </div>
+          <div className="field" style={{ marginTop: 12 }}>
+            <label htmlFor="signup-email">Email</label>
+            <input id="signup-email" type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@company.com" />
+            {errors.email && <span className="field-error">{errors.email}</span>}
+          </div>
+          <div className="form-grid" style={{ marginTop: 12 }}>
+            <div className="field">
+              <label htmlFor="signup-password">Password (min 8 characters)</label>
+              <input id="signup-password" type="password" autoComplete="new-password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="At least 8 characters" />
+              {errors.password && <span className="field-error">{errors.password}</span>}
+            </div>
+            <div className="field">
+              <label htmlFor="signup-confirm">Confirm password</label>
+              <input id="signup-confirm" type="password" autoComplete="new-password" value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder="Repeat your password" />
+              {errors.confirm && <span className="field-error">{errors.confirm}</span>}
+            </div>
+          </div>
+          {serverError && <p className="field-error" role="alert">{serverError}</p>}
+          <div className="row" style={{ marginTop: 16 }}>
+            <button className="primary" type="submit" disabled={busy}>{busy ? "Creating workspace…" : "Create workspace"}</button>
+            <button type="button" onClick={onHome}>← Home</button>
+          </div>
+        </form>
+        <p className="muted" style={{ marginTop: 14 }}>
+          Already have a workspace? <button className="text-btn" onClick={onLogin}>Log in →</button>
+        </p>
+      </div>
+    </div>
+  );
+}
+
+const DEMO_LOGINS = [
+  { label: "Admin demo", email: "admin@demo.local", password: "admin123", role: "admin" },
+  { label: "Responder demo", email: "responder@demo.local", password: "responder123", role: "responder" },
+  { label: "Viewer demo", email: "viewer@demo.local", password: "viewer123", role: "viewer" },
+];
+
+function LoginView({
+  onAuthed,
+  onSignup,
+  onHome,
+}: {
+  onAuthed: (r: AuthResponse) => void;
+  onSignup: () => void;
+  onHome: () => void;
+}) {
+  const [email, setEmail] = useState("admin@demo.local");
+  const [password, setPassword] = useState("admin123");
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [serverError, setServerError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const errs: Record<string, string> = {};
+    if (!EMAIL_RE.test(email.trim())) errs.email = "Enter a valid email address.";
+    if (!password) errs.password = "Enter your password.";
+    setErrors(errs);
+    setServerError("");
+    if (Object.keys(errs).length > 0) return;
+    setBusy(true);
+    try {
+      const r = (await api.login(email.trim(), password)) as AuthResponse;
+      onAuthed(r);
+    } catch (err) {
+      setServerError(errText(err));
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div className="auth-wrap">
+      <div className="card">
+        <h2>Log in to your workspace</h2>
+        <p className="muted">Log in to approve, execute and manage your workspace. Reads work without login.</p>
+        <form onSubmit={submit} noValidate>
+          <div className="field">
+            <label htmlFor="auth-email">Email</label>
+            <input id="auth-email" type="email" autoComplete="username" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@company.com" />
+            {errors.email && <span className="field-error">{errors.email}</span>}
+          </div>
+          <div className="field" style={{ marginTop: 12 }}>
+            <label htmlFor="auth-password">Password</label>
+            <input id="auth-password" type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" />
+            {errors.password && <span className="field-error">{errors.password}</span>}
+          </div>
+          {serverError && <p className="field-error" role="alert">{serverError}</p>}
+          <div className="row" style={{ marginTop: 16 }}>
+            <button className="primary" type="submit" disabled={busy}>{busy ? "Logging in…" : "Log in"}</button>
+            <button type="button" onClick={onHome}>← Home</button>
+          </div>
+        </form>
+        <h4>Demo logins — clearly labelled, for trying the console</h4>
+        <p className="muted">These fill in the form only — they do not log you in automatically. Pick one, then press “Log in”.</p>
+        <div className="row">
+          {DEMO_LOGINS.map((d) => (
+            <button key={d.email} type="button" onClick={() => { setEmail(d.email); setPassword(d.password); setServerError(""); }}>
+              {d.label} ({d.role})
+            </button>
+          ))}
+        </div>
+        <p className="muted" style={{ marginTop: 14 }}>
+          No workspace yet? <button className="text-btn" onClick={onSignup}>Create your workspace →</button>
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function IntegrationsView({
+  isAdmin,
+  orgMe,
+  onOrgMeRefresh,
+}: {
+  isAdmin: boolean;
+  orgMe: OrgMe | null;
+  onOrgMeRefresh: () => void;
+}) {
+  const [statusRaw, setStatusRaw] = useState<unknown>(null);
+  const [orgList, setOrgList] = useState<OrgIntegration[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [forms, setForms] = useState<Record<string, IntegForm>>({});
+  const [saving, setSaving] = useState<string | null>(null);
+  const [testing, setTesting] = useState<string | null>(null);
+  const [testResults, setTestResults] = useState<Record<string, { ok: boolean; message: string }>>({});
+  const [cardMsg, setCardMsg] = useState<Record<string, string>>({});
+  const [deleting, setDeleting] = useState<string | null>(null);
+  const [rotating, setRotating] = useState(false);
+  const [rotateError, setRotateError] = useState("");
+  const [newToken, setNewToken] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const load = async (silent = false) => {
+    if (!silent) setLoading(true);
+    setError("");
+    try {
+      const [s, list] = await Promise.all([api.integrationsStatus(), api.listOrgIntegrations()]);
+      setStatusRaw(s);
+      const items = (Array.isArray(list) ? list : ((list as Any).integrations ?? [])) as OrgIntegration[];
+      setOrgList(items);
+      setForms((prev) => {
+        const next = { ...prev };
+        for (const row of items) {
+          if (!next[row.name]) {
+            const cfg: Record<string, string> = {};
+            for (const [k, v] of Object.entries(row.config ?? {})) cfg[k] = String(v ?? "");
+            next[row.name] = { config: cfg, secrets: {}, provider: row.provider ?? "" };
+          }
+        }
+        return next;
+      });
+    } catch (e) {
+      setError(`Could not load integrations: ${errText(e)}`);
+    }
+    setLoading(false);
+  };
+  useEffect(() => {
+    if (isAdmin) load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAdmin]);
+
+  if (!isAdmin) {
+    return (
+      <div className="card">
+        <h2>Integrations — Connect your tools</h2>
+        <p className="muted">
+          Integrations are admin only. Log in as a workspace admin to connect Prometheus, logs,
+          Grafana, Jira and Slack for this workspace.
+        </p>
+      </div>
+    );
+  }
+
+  const statusByName = normalizeStatus(statusRaw, new Set(orgList.map((o) => o.name)));
+  const formFor = (name: string): IntegForm => forms[name] ?? EMPTY_FORM;
+  const setField = (name: string, kind: "config" | "secrets" | "provider", key: string, value: string) =>
+    setForms((prev) => {
+      const cur = prev[name] ?? EMPTY_FORM;
+      return {
+        ...prev,
+        [name]:
+          kind === "provider"
+            ? { ...cur, provider: value }
+            : { ...cur, [kind]: { ...cur[kind], [key]: value } },
+      };
+    });
+
+  const save = async (name: IntegName) => {
+    const f = formFor(name);
+    const meta = INTEGRATION_META[name];
+    const config: Record<string, unknown> = {};
+    for (const field of meta.configFields) {
+      const v = (f.config[field.key] ?? "").trim();
+      if (v) config[field.key] = v;
+    }
+    const secrets: Record<string, string> = {};
+    for (const field of meta.secretFields) {
+      const v = (f.secrets[field.key] ?? "").trim();
+      if (v) secrets[field.key] = v;
+    }
+    setSaving(name);
+    setCardMsg((prev) => ({ ...prev, [name]: "" }));
+    try {
+      await api.saveIntegration(name, f.provider || undefined, config, secrets);
+      // Secrets are never shown again: clear the inputs immediately.
+      setForms((prev) => ({ ...prev, [name]: { ...formFor(name), secrets: {} } }));
+      setCardMsg((prev) => ({
+        ...prev,
+        [name]: "Saved — secret fields cleared from this form and never shown again.",
+      }));
+      await load(true);
+    } catch (e) {
+      setCardMsg((prev) => ({ ...prev, [name]: `Save failed: ${errText(e)}` }));
+    }
+    setSaving(null);
+  };
+
+  const test = async (name: IntegName) => {
+    setTesting(name);
+    try {
+      const r = (await api.testIntegration(name)) as { ok?: boolean; message?: string };
+      setTestResults((prev) => ({
+        ...prev,
+        [name]: {
+          ok: r.ok === true,
+          message: String(r.message ?? (r.ok ? "Connection OK" : "Connection failed")),
+        },
+      }));
+    } catch (e) {
+      setTestResults((prev) => ({ ...prev, [name]: { ok: false, message: `Test failed: ${errText(e)}` } }));
+    }
+    setTesting(null);
+  };
+
+  const remove = async (name: IntegName) => {
+    if (
+      !window.confirm(
+        `Delete the ${INTEGRATION_META[name].label} integration for this workspace? Its saved settings and secrets will be removed.`
+      )
+    )
+      return;
+    setDeleting(name);
+    try {
+      await api.deleteIntegration(name);
+      setForms((prev) => {
+        const next = { ...prev };
+        delete next[name];
+        return next;
+      });
+      setTestResults((prev) => {
+        const next = { ...prev };
+        delete next[name];
+        return next;
+      });
+      await load(true);
+    } catch (e) {
+      setCardMsg((prev) => ({ ...prev, [name]: `Delete failed: ${errText(e)}` }));
+    }
+    setDeleting(null);
+  };
+
+  const rotate = async () => {
+    setRotating(true);
+    setRotateError("");
+    setNewToken(null);
+    setCopied(false);
+    try {
+      const r = (await api.rotateWebhookToken()) as { webhook_token: string };
+      setNewToken(String(r.webhook_token));
+      onOrgMeRefresh();
+    } catch (e) {
+      setRotateError(`Rotate failed: ${errText(e)}`);
+    }
+    setRotating(false);
+  };
+
+  const copyToken = async () => {
+    if (!newToken) return;
+    try {
+      await navigator.clipboard.writeText(newToken);
+      setCopied(true);
+    } catch {
+      /* clipboard unavailable — the token is still visible in the box to copy manually */
+    }
+  };
+
+  const backendBase = API_URL || window.location.origin;
+  const maskedToken = orgMe?.organization?.webhook_token_masked ?? null;
+
+  return (
+    <>
+      <div className="card">
+        <h2>Integrations — Connect your tools</h2>
+        <p className="muted">
+          Connect this workspace&apos;s own Prometheus, logs, Grafana, Jira and Slack. Settings
+          saved here apply to this workspace only. Secrets are stored encrypted and never shown
+          again — leave a secret field blank to keep the saved value.
+        </p>
+        {loading && <p className="muted">Loading integrations…</p>}
+        {error && <p className="field-error" role="alert">{error}</p>}
+        {!loading && !error && (
+          <div className="conn-grid">
+            {INTEGRATION_NAMES.map((name) => {
+              const meta = INTEGRATION_META[name];
+              const s = statusByName[name];
+              const f = formFor(name);
+              const row = orgList.find((o) => o.name === name);
+              const result = testResults[name];
+              return (
+                <div key={name} className="conn-card int-card">
+                  <strong>{meta.label}</strong>
+                  <span className={`badge ${s.configured ? "green" : "red"}`}>{statusLabel(s)}</span>
+                  <div className="muted">{meta.blurb}</div>
+                  <div className="muted">
+                    {s.masked_url ? `URL: ${s.masked_url}` : "No URL configured"}
+                    {s.provider ? ` · Provider: ${s.provider}` : ""}
+                    {s.last_test_ok === true ? " · Last test: passed" : s.last_test_ok === false ? " · Last test: failed" : ""}
+                  </div>
+                  {row && Object.keys(row.secrets_masked ?? {}).length > 0 && (
+                    <div className="muted">
+                      Saved secrets: {Object.entries(row.secrets_masked).map(([k, v]) => `${k}: ${v}`).join(" · ")}
+                    </div>
+                  )}
+                  <div className="int-form">
+                    {meta.providerOptions && (
+                      <div className="field">
+                        <label htmlFor={`int-${name}-provider`}>Provider</label>
+                        <select
+                          id={`int-${name}-provider`}
+                          value={f.provider}
+                          onChange={(e) => setField(name, "provider", "", e.target.value)}
+                        >
+                          <option value="">Select a provider…</option>
+                          {meta.providerOptions.map((p) => (
+                            <option key={p} value={p}>{p}</option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                    {meta.configFields.map((field) => (
+                      <div className="field" key={field.key}>
+                        <label htmlFor={`int-${name}-${field.key}`}>{field.label}</label>
+                        <input
+                          id={`int-${name}-${field.key}`}
+                          value={f.config[field.key] ?? ""}
+                          onChange={(e) => setField(name, "config", field.key, e.target.value)}
+                          placeholder={field.placeholder ?? ""}
+                          autoComplete="off"
+                        />
+                      </div>
+                    ))}
+                    {meta.secretFields.map((field) => (
+                      <div className="field" key={field.key}>
+                        <label htmlFor={`int-${name}-${field.key}`}>{field.label} (secret)</label>
+                        <input
+                          id={`int-${name}-${field.key}`}
+                          type="password"
+                          value={f.secrets[field.key] ?? ""}
+                          onChange={(e) => setField(name, "secrets", field.key, e.target.value)}
+                          placeholder={row ? "Leave blank to keep the saved value" : "Stored encrypted, never shown again"}
+                          autoComplete="new-password"
+                        />
+                      </div>
+                    ))}
+                    <p className="muted">Secrets are stored encrypted, never shown again.</p>
+                    {result && (
+                      <p className={result.ok ? "ok-text" : "field-error"} role="status">
+                        {result.ok ? "✓ " : "✗ "}{result.message}
+                      </p>
+                    )}
+                    {cardMsg[name] && <p className="muted" role="status">{cardMsg[name]}</p>}
+                    <div className="row">
+                      <button className="primary" disabled={saving === name || testing === name} onClick={() => save(name)}>
+                        {saving === name ? "Saving…" : "Save"}
+                      </button>
+                      <button disabled={testing === name || saving === name} onClick={() => test(name)}>
+                        {testing === name ? "Testing…" : "Test connection"}
+                      </button>
+                      <button
+                        className="danger"
+                        disabled={deleting === name || !row}
+                        title={row ? "Delete this integration" : "Nothing saved yet — nothing to delete"}
+                        onClick={() => remove(name)}
+                      >
+                        {deleting === name ? "Deleting…" : "Delete"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <div className="card">
+        <h2>Alertmanager webhook — inbound alerts for this workspace</h2>
+        <p className="muted">
+          Point Alertmanager (or any alert sender) at this workspace&apos;s webhook URL. Alerts
+          sent here land in this workspace only. The token itself is a secret: it is shown in
+          full exactly once, when it is rotated — never again afterwards.
+        </p>
+        <div className="mono">{`POST ${backendBase}/api/webhooks/alert/<webhook-token>`}</div>
+        <p className="muted" style={{ marginTop: 10 }}>
+          {maskedToken
+            ? <>Current token (masked): <strong>{maskedToken}</strong> — the full token is not stored or shown anywhere.</>
+            : orgMe
+              ? "No masked token available for this workspace — rotate the token below to create one."
+              : "Workspace info has not loaded yet — the masked token cannot be shown."}
+        </p>
+        {rotateError && <p className="field-error" role="alert">{rotateError}</p>}
+        {newToken && (
+          <div className="token-box" role="alert">
+            <strong>⚠️ New webhook token — copy it now, it will never be shown again.</strong>
+            <div className="mono" style={{ marginTop: 8 }}>{newToken}</div>
+            <div className="row" style={{ marginTop: 8 }}>
+              <button onClick={copyToken}>{copied ? "Copied ✓" : "Copy token"}</button>
+              <button onClick={() => { setNewToken(null); setCopied(false); }}>I&apos;ve copied it — hide</button>
+            </div>
+          </div>
+        )}
+        <div className="row" style={{ marginTop: 12 }}>
+          <button disabled={rotating} onClick={rotate}>
+            {rotating ? "Rotating…" : "Rotate webhook token"}
+          </button>
+          {!orgMe && <button onClick={onOrgMeRefresh}>Retry loading workspace info</button>}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function TeamView({ role }: { role: string | null }) {
+  const canList = role === "admin" || role === "responder";
+  const isAdmin = role === "admin";
+  const [members, setMembers] = useState<Member[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [email, setEmail] = useState("");
+  const [newRole, setNewRole] = useState("viewer");
+  const [formError, setFormError] = useState("");
+  const [formMsg, setFormMsg] = useState("");
+  const [adding, setAdding] = useState(false);
+
+  const load = async (silent = false) => {
+    if (!silent) setLoading(true);
+    setError("");
+    try {
+      const r = (await api.listMembers()) as { members?: Member[] };
+      setMembers(Array.isArray(r.members) ? r.members : Array.isArray(r as unknown as Member[]) ? (r as unknown as Member[]) : []);
+    } catch (e) {
+      setMembers([]);
+      setError(`Could not load members: ${errText(e)}`);
+    }
+    setLoading(false);
+  };
+  useEffect(() => {
+    if (canList) load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canList]);
+
+  if (!canList) {
+    return (
+      <div className="card">
+        <h2>Team</h2>
+        <p className="muted">
+          Team membership is visible to workspace admins and responders. Log in with one of
+          those roles to see who is in this workspace.
+        </p>
+      </div>
+    );
+  }
+
+  const add = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setFormError("");
+    setFormMsg("");
+    if (!EMAIL_RE.test(email.trim())) {
+      setFormError("Enter a valid email address.");
+      return;
+    }
+    setAdding(true);
+    try {
+      const r = (await api.addMember(email.trim(), newRole)) as { created?: boolean; user?: Member };
+      setFormMsg(
+        r.created === true
+          ? "Member added. Note: this is a new account — they cannot log in yet, because Phase 7 has no password-set flow (a new invitee gets a random unusable password). Adding an existing user works end to end."
+          : `Member added — their role in this workspace is now ${newRole}.`
+      );
+      setEmail("");
+      await load(true);
+    } catch (err) {
+      setFormError(errText(err));
+    }
+    setAdding(false);
+  };
+
+  return (
+    <div className="card">
+      <h2>Team</h2>
+      <p className="muted">People in this workspace. Only workspace admins can add members.</p>
+      {loading && <p className="muted">Loading members…</p>}
+      {error && <p className="field-error" role="alert">{error}</p>}
+      {!loading && !error && members.length === 0 && <p className="muted">No members yet.</p>}
+      {!loading && members.length > 0 && (
+        <div className="table-scroll">
+          <table className="mini-table">
+            <thead><tr><th>Name</th><th>Email</th><th>Role</th></tr></thead>
+            <tbody>
+              {members.map((m) => (
+                <tr key={m.id}>
+                  <td><strong>{m.name || "—"}</strong></td>
+                  <td>{m.email}</td>
+                  <td><span className={`badge ${m.role === "admin" ? "amber" : m.role === "responder" ? "blue" : "green"}`}>{m.role}</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {isAdmin ? (
+        <>
+          <h4>Add a member</h4>
+          <form onSubmit={add} noValidate>
+            <div className="form-grid">
+              <div className="field">
+                <label htmlFor="team-email">Email</label>
+                <input id="team-email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="teammate@company.com" />
+              </div>
+              <div className="field">
+                <label htmlFor="team-role">Role</label>
+                <select id="team-role" value={newRole} onChange={(e) => setNewRole(e.target.value)}>
+                  <option value="admin">admin</option>
+                  <option value="responder">responder</option>
+                  <option value="viewer">viewer</option>
+                </select>
+              </div>
+            </div>
+            {formError && <p className="field-error" role="alert">{formError}</p>}
+            {formMsg && <p className="muted" role="status">{formMsg}</p>}
+            <div className="row" style={{ marginTop: 12 }}>
+              <button className="primary" type="submit" disabled={adding}>{adding ? "Adding…" : "Add member"}</button>
+            </div>
+          </form>
+        </>
+      ) : (
+        <p className="muted">Only workspace admins can add members — you are signed in as {role}.</p>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [health, setHealth] = useState<Any | null>(null);
   const [incidents, setIncidents] = useState<Any[]>([]);
@@ -195,15 +957,19 @@ export default function App() {
   const [scenarios, setScenarios] = useState<Any[]>([]);
   const [scenario, setScenario] = useState("checkout-oom");
   const [evalRuns, setEvalRuns] = useState<Any[]>([]);
-  const [tab, setTab] = useState<"incidents" | "eval" | "knowledge">("incidents");
+  const [tab, setTab] = useState<"incidents" | "eval" | "knowledge" | "integrations" | "team">("incidents");
   const [email, setEmail] = useState("admin@demo.local");
   const [password, setPassword] = useState("admin123");
-  const [user, setUser] = useState<Any | null>(null);
+  const [user, setUser] = useState<Any | null>(() => (getStoredUser() as Any | null));
+  const [org, setOrg] = useState<Org | null>(() => getOrg());
+  const [orgMe, setOrgMe] = useState<OrgMe | null>(null);
+  const [orgMeError, setOrgMeError] = useState("");
   const [loginBusy, setLoginBusy] = useState(false);
   const [notice, setNotice] = useState<Notice>(null);
   const [busy, setBusy] = useState(false);
-  const [view, setView] = useState<"landing" | "app">("landing");
+  const [view, setView] = useState<"landing" | "app" | "signup" | "login">("landing");
   const [integrations, setIntegrations] = useState<Any | null>(null);
+  const [orgIntegrations, setOrgIntegrations] = useState<OrgIntegration[]>([]);
   const [intLoading, setIntLoading] = useState(false);
   const [intError, setIntError] = useState("");
   const [notifyBusy, setNotifyBusy] = useState<"jira" | "slack" | null>(null);
@@ -224,6 +990,55 @@ export default function App() {
   const flash = (text: string, kind: "info" | "error" | "success" = "info") =>
     setNotice({ text, kind });
 
+  // Workspace (org) info for the logged-in user: effective role + masked
+  // webhook token (admin only). A 401 means the saved token is stale —
+  // clear auth so the console falls back to demo browsing.
+  const loadOrgMe = async () => {
+    try {
+      const me = (await api.getOrgMe()) as OrgMe;
+      setOrgMe(me);
+      if (me.organization) {
+        setOrg(me.organization);
+        localStorage.setItem("ip_org", JSON.stringify(me.organization));
+      }
+      if (me.role) setUser((prev) => (prev ? { ...prev, role: me.role } : prev));
+      setOrgMeError("");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.startsWith("401")) {
+        clearAuth();
+        setUser(null);
+        setOrg(null);
+        setOrgMe(null);
+      } else {
+        setOrgMeError(`Could not load workspace info: ${errText(e)}`);
+      }
+    }
+  };
+
+  // Shared login/signup success path: persist token + org + user, enter console.
+  const applyAuth = (r: AuthResponse) => {
+    saveAuth(r);
+    setUser(r.user as Any);
+    setOrg(r.organization ?? null);
+    setOrgMe(null);
+    setView("app");
+    flash(
+      `Logged in as ${r.user.email} (${r.user.role})${r.organization ? ` — workspace: ${r.organization.name}` : ""}`,
+      "success"
+    );
+    loadOrgMe();
+  };
+
+  const signOut = () => {
+    clearAuth();
+    setUser(null);
+    setOrg(null);
+    setOrgMe(null);
+    setTab("incidents");
+    flash("Signed out — token and workspace cleared.", "info");
+  };
+
   const load = async () => {
     const first = firstLoadRef.current;
     try {
@@ -239,6 +1054,9 @@ export default function App() {
     }
   };
   useEffect(() => { load(); }, []);
+  // Restore a saved session: if a token was stored, refresh the workspace
+  // info (and effective role) from the backend.
+  useEffect(() => { if (localStorage.getItem("ip_token")) loadOrgMe(); }, []);
 
   const loadIntegrations = async () => {
     setIntLoading(true); setIntError("");
@@ -247,6 +1065,14 @@ export default function App() {
     } catch {
       setIntegrations(null);
       setIntError("Could not reach backend — integrations status unavailable");
+    }
+    // Per-org rows (best effort: unauthenticated demo browsing gets a 401
+    // here, which just means no workspace rows to attribute status to).
+    try {
+      const list = await api.listOrgIntegrations();
+      setOrgIntegrations(Array.isArray(list) ? (list as OrgIntegration[]) : (((list as Any).integrations ?? []) as OrgIntegration[]));
+    } catch {
+      setOrgIntegrations([]);
     }
     setIntLoading(false);
   };
@@ -309,10 +1135,8 @@ export default function App() {
     }
     setLoginBusy(true);
     try {
-      const r = await api.login(email.trim(), password);
-      localStorage.setItem("ip_token", r.token);
-      setUser(r.user);
-      flash(`Logged in as ${r.user.email} (${r.user.role})`, "success");
+      const r = (await api.login(email.trim(), password)) as AuthResponse;
+      applyAuth(r);
     } catch (err) { flash(`Login failed: ${(err as Error).message}`, "error"); }
     setLoginBusy(false);
   };
@@ -348,10 +1172,21 @@ export default function App() {
     setNotifyBusy(null);
   };
 
+  // Effective role inside the current workspace (org membership wins over
+  // the token role); drives the admin-only Integrations/Team gating.
+  const effectiveRole = orgMe?.role ?? (user ? (user.role as string) : null);
+  // Per-org integrations status (normalised from the old global map shape
+  // or the new per-org list shape — see normalizeStatus).
+  const statusByName = normalizeStatus(integrations, new Set(orgIntegrations.map((o) => o.name)));
+
   return (
     <>
       {view === "landing" ? (
-        <Landing health={health} onEnter={() => setView("app")} />
+        <Landing health={health} onEnter={() => setView("app")} onSignup={() => setView("signup")} />
+      ) : view === "signup" ? (
+        <SignupView onAuthed={applyAuth} onLogin={() => setView("login")} onHome={() => setView("landing")} />
+      ) : view === "login" ? (
+        <LoginView onAuthed={applyAuth} onSignup={() => setView("signup")} onHome={() => setView("landing")} />
       ) : (
       <>
       <header>
@@ -361,10 +1196,35 @@ export default function App() {
           ? <span className={`badge ${health.demo_mode ? "amber" : "green"}`}>{health.demo_mode ? "Demo mode — add GROQ_API_KEY for live LLM" : `Live LLM: ${health.model}`}</span>
           : <span className="badge blue">Connecting to backend…</span>}
         <span style={{ flex: 1 }} />
+        {org && <span className="badge blue">Workspace: {org.name}</span>}
+        {user ? (
+          <button onClick={signOut}>Sign out</button>
+        ) : (
+          <>
+            <button onClick={() => setView("login")}>Log in</button>
+            <button className="primary" onClick={() => setView("signup")}>Create workspace</button>
+          </>
+        )}
         <button onClick={() => setView("landing")}>← Home</button>
         <button onClick={() => setTab("incidents")} aria-current={tab === "incidents" ? "page" : undefined}>Incidents</button>
         <button onClick={() => setTab("eval")} aria-current={tab === "eval" ? "page" : undefined}>Eval dashboard</button>
         <button onClick={() => setTab("knowledge")} aria-current={tab === "knowledge" ? "page" : undefined}>Knowledge base</button>
+        <button
+          onClick={() => setTab("integrations")}
+          aria-current={tab === "integrations" ? "page" : undefined}
+          disabled={!user}
+          title={!user ? "Log in as a workspace admin to manage integrations" : effectiveRole !== "admin" ? "Integrations are admin only" : "Connect your tools"}
+        >
+          Integrations
+        </button>
+        <button
+          onClick={() => setTab("team")}
+          aria-current={tab === "team" ? "page" : undefined}
+          disabled={!user}
+          title={!user ? "Log in to see your workspace team" : "Team members"}
+        >
+          Team
+        </button>
       </header>
       <main>
         {notice && (
@@ -417,11 +1277,13 @@ export default function App() {
               </div>
               <button className="primary" type="submit" disabled={loginBusy}>{loginBusy ? "Logging in…" : "Log in"}</button>
             </form>
+            <p className="muted">No workspace yet? <button className="text-btn" onClick={() => setView("signup")}>Create your workspace →</button> Or use the full login page for demo logins.</p>
           </div>
         )}
         {user && (
-          <p className="muted">Signed in as <strong>{user.email as string}</strong> ({user.role as string}) — you can approve, execute and notify.</p>
+          <p className="muted">Signed in as <strong>{user.email as string}</strong> ({user.role as string}){org ? <> — workspace <strong>{org.name}</strong></> : ""} — you can approve, execute and notify.</p>
         )}
+        {user && orgMeError && <p className="muted">⚠️ {orgMeError}</p>}
         {tab === "incidents" && (
           <>
             <div className="card">
@@ -447,49 +1309,27 @@ export default function App() {
               </div>
               {intLoading && !integrations && <p className="muted">Checking integrations…</p>}
               {intError && <p className="muted">⚠️ {intError}</p>}
-              {integrations && (() => {
-                const prom = (integrations.prometheus ?? {}) as Any;
-                const logs = (integrations.logs ?? {}) as Any;
-                const graf = (integrations.grafana ?? {}) as Any;
-                const promStatus = !prom.configured ? "Not connected" : prom.reachable === true ? "Connected" : prom.reachable === false ? "Unreachable" : "Configured — reachability unknown";
-                const promCls = !prom.configured ? "red" : prom.reachable === true ? "green" : prom.reachable === false ? "red" : "amber";
-                const logsProvider = typeof logs.provider === "string" && logs.provider !== "none" && logs.provider !== "" ? (logs.provider as string) : null;
-                const grafUrl = typeof graf.url === "string" && graf.url ? (graf.url as string) : null;
-                const jira = (integrations.jira ?? {}) as Any;
-                const slack = (integrations.slack ?? {}) as Any;
-                const jiraUrl = typeof jira.url === "string" && jira.url ? (jira.url as string) : null;
-                const jiraProject = typeof jira.project === "string" && jira.project ? (jira.project as string) : null;
-                const slackChannel = typeof slack.channel === "string" && slack.channel ? (slack.channel as string) : null;
-                return (
-                  <div className="conn-grid">
-                    <div className="conn-card">
-                      <strong>Prometheus</strong>
-                      <span className={`badge ${promCls}`}>{promStatus}</span>
-                      <div className="muted">{typeof prom.url === "string" && prom.url ? prom.url : "No Prometheus URL configured"}</div>
-                    </div>
-                    <div className="conn-card">
-                      <strong>Logs</strong>
-                      {logsProvider ? <span className="badge blue">{logsProvider}</span> : <span className="badge red">Not connected</span>}
-                      <div className="muted">{logsProvider ? `Provider: ${logsProvider}` : "No logs provider configured"}</div>
-                    </div>
-                    <div className="conn-card">
-                      <strong>Grafana</strong>
-                      {graf.configured ? <span className="badge green">Configured</span> : <span className="badge red">Not connected</span>}
-                      <div className="muted">{graf.configured && grafUrl ? <a href={grafUrl} target="_blank" rel="noreferrer">Open Grafana ↗</a> : "No Grafana URL configured"}</div>
-                    </div>
-                    <div className="conn-card">
-                      <strong>Jira</strong>
-                      {jira.configured ? <span className="badge green">Configured</span> : <span className="badge red">Not connected</span>}
-                      <div className="muted">{jira.configured ? `${jiraUrl ?? ""}${jiraProject ? ` · project ${jiraProject}` : ""}` : "No Jira configured — set JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY"}</div>
-                    </div>
-                    <div className="conn-card">
-                      <strong>Slack</strong>
-                      {slack.configured ? <span className="badge green">Configured</span> : <span className="badge red">Not connected</span>}
-                      <div className="muted">{slack.configured ? `Channel: ${slackChannel ?? "(webhook default)"}` : "No Slack webhook configured — set SLACK_WEBHOOK_URL"}</div>
-                    </div>
-                  </div>
-                );
-              })()}
+              {integrations && (
+                <div className="conn-grid">
+                  {(["prometheus", "logs", "grafana", "jira", "slack"] as const).map((name) => {
+                    const s = statusByName[name];
+                    const label = name === "prometheus" ? "Prometheus" : name === "logs" ? "Logs" : name === "grafana" ? "Grafana" : name === "jira" ? "Jira" : "Slack";
+                    return (
+                      <div key={name} className="conn-card">
+                        <strong>{label}</strong>
+                        {s.configured
+                          ? <span className="badge green">{s.source === "org" ? "Configured via your workspace" : s.source === "global" ? "Configured globally" : "Configured"}</span>
+                          : <span className="badge red">Not connected</span>}
+                        <div className="muted">
+                          {s.configured
+                            ? <>{s.masked_url ? s.masked_url : ""}{s.provider ? ` · Provider: ${s.provider}` : ""}{s.last_test_ok === true ? " · Last test: passed" : s.last_test_ok === false ? " · Last test: failed" : ""}</>
+                            : `No ${label} configured`}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
               {!integrations && !intLoading && !intError && <p className="muted">Integrations status not loaded yet.</p>}
             </div>
             <div className="card">
@@ -571,8 +1411,8 @@ export default function App() {
                       );
                     })()}
                     {(() => {
-                      const jiraConfigured = Boolean((((integrations as Any)?.jira ?? {}) as Any).configured);
-                      const slackConfigured = Boolean((((integrations as Any)?.slack ?? {}) as Any).configured);
+                      const jiraConfigured = statusByName.jira.configured;
+                      const slackConfigured = statusByName.slack.configured;
                       const linkedKey = typeof selected.jira_issue_key === "string" && selected.jira_issue_key ? (selected.jira_issue_key as string) : null;
                       const linkedUrl = typeof selected.jira_issue_url === "string" && selected.jira_issue_url ? (selected.jira_issue_url as string) : null;
                       return (
@@ -720,7 +1560,13 @@ export default function App() {
             )}
           </div>
         )}
-        <p className="muted">IncidentPilot v1 · Simulated services only · Jira/Slack optional via backend env (see README) · What it will not do: no unapproved execution, no deletions, no production DB writes.</p>
+        {tab === "integrations" && (
+          <IntegrationsView isAdmin={effectiveRole === "admin"} orgMe={orgMe} onOrgMeRefresh={loadOrgMe} />
+        )}
+        {tab === "team" && (
+          <TeamView role={effectiveRole} />
+        )}
+        <p className="muted">IncidentPilot v1 · Simulated services only · Jira/Slack can be connected per workspace in Integrations · What it will not do: no unapproved execution, no deletions, no production DB writes.</p>
         </>
         )}
       </main>

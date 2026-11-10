@@ -1,6 +1,6 @@
 type Any = Record<string, unknown>;
 
-export default function Landing({ health, onEnter }: { health: Any | null; onEnter: () => void }) {
+export default function Landing({ health, onEnter, onSignup }: { health: Any | null; onEnter: () => void; onSignup: () => void }) {
   const demo = health ? Boolean(health.demo_mode) : true;
   return (
     <div className="landing">
@@ -11,6 +11,7 @@ export default function Landing({ health, onEnter }: { health: Any | null; onEnt
           <a href="#features">Features</a>
           <a href="#results">Results</a>
         </nav>
+        <button onClick={onSignup}>Create your workspace</button>
         <button className="primary" onClick={onEnter}>Open console →</button>
       </header>
 
@@ -29,6 +30,7 @@ export default function Landing({ health, onEnter }: { health: Any | null; onEnt
           </p>
           <div className="row">
             <button className="primary big" onClick={onEnter}>🔥 Try the live demo</button>
+            <button className="ghost-btn" onClick={onSignup}>Create your workspace →</button>
             <a className="ghost-btn" href="https://github.com/Gautam825406/incidentpilot" target="_blank" rel="noreferrer">View on GitHub</a>
           </div>
           <p className="muted">
@@ -56,6 +58,7 @@ export default function Landing({ health, onEnter }: { health: Any | null; onEnt
           </div>
           <button className="primary" style={{ width: "100%" }} onClick={onEnter}>Open the console and run it yourself</button>
           <p className="muted">Demo login: admin@demo.local / admin123</p>
+          <p className="muted">Want your own isolated workspace? <button className="text-btn" onClick={onSignup}>Create your workspace →</button> Your incidents, team and credentials stay separate from the demo.</p>
         </div>
       </section>
 

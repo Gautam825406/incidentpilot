@@ -29,9 +29,11 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .integrations.grafana import dashboard_url
-from .integrations.logs import get_log_provider, group_exceptions, search_logs_real
-from .integrations.prometheus import get_prometheus_client
+from .integrations.grafana import dashboard_url, dashboard_url_for_org
+from .integrations.logs import (get_log_provider, get_log_provider_for_org,
+                               group_exceptions, search_logs_real,
+                               search_logs_real_for_org)
+from .integrations.prometheus import get_prometheus_client, get_prometheus_client_for_org
 from .llm import GroqClient
 from .models import AgentRun, Evidence, Hypothesis, Incident, IncidentEvent, RemediationPlan
 from .security import sanitise_evidence
@@ -90,7 +92,23 @@ PLAN_TEMPLATES = {
 }
 
 
-def _integration_config(service: str) -> dict:
+def _resolve_incident_org_id(db: Session, incident: Incident) -> str | None:
+    """Phase 7 — org for an investigation. The incident's own org_id when
+    set; when None (pre–Phase 7 rows) the demo org id, so a demo-org
+    integration configured there is honoured. Returns None when even the
+    demo org cannot be resolved — callers then fall back to global config.
+    Never raises."""
+    if getattr(incident, "org_id", None):
+        return incident.org_id
+    try:
+        from .seed import get_or_create_demo_org
+        return get_or_create_demo_org(db).id
+    except Exception:
+        return None
+
+
+def _integration_config(service: str, db: Session | None = None,
+                        org_id: str | None = None) -> dict:
     """Configured-ness of each real integration (no network calls).
 
     Phase 6: the defaults are the embedded providers (telemetry emitted
@@ -99,28 +117,53 @@ def _integration_config(service: str) -> dict:
     "embedded" / "elasticsearch" / "opensearch"). "available" starts
     False and is filled in by run_investigation() once the agents have
     actually queried the integrations.
+
+    Phase 7: with ``db`` given, the per-org providers/dashboards are
+    resolved for ``org_id`` (falling back to global config when the org
+    has none); without ``db`` the behaviour is exactly the pre–Phase 7
+    global one.
     """
     try:
-        logs_provider = get_log_provider().provider_name
+        if db is not None:
+            logs_provider = get_log_provider_for_org(db, org_id).provider_name
+        else:
+            logs_provider = get_log_provider().provider_name
     except Exception:
         logs_provider = "none"
     try:
-        prom_client = get_prometheus_client()
+        if db is not None:
+            prom_client = get_prometheus_client_for_org(db, org_id)
+        else:
+            prom_client = get_prometheus_client()
         prom_provider = getattr(prom_client, "source", "prometheus") if prom_client else "none"
     except Exception:
         prom_provider = "none"
     try:
-        dash = dashboard_url(service)
+        if db is not None:
+            dash = dashboard_url_for_org(db, org_id, service)
+            grafana_configured = bool(dash) or bool((settings.grafana_url or "").strip())
+            if not grafana_configured:
+                try:
+                    from .org_integrations import get_org_integration_decrypted
+                    _org_graf = get_org_integration_decrypted(db, org_id, "grafana") if org_id else None
+                    grafana_configured = bool(_org_graf and (_org_graf.get("config") or {}).get("url"))
+                except Exception:
+                    pass
+        else:
+            dash = dashboard_url(service)
+            grafana_configured = bool((settings.grafana_url or "").strip())
     except Exception:
         dash = None
+        grafana_configured = False
     return {
         "prometheus": {"configured": prom_provider != "none", "provider": prom_provider, "available": False},
         "logs": {"provider": logs_provider, "available": False},
-        "grafana": {"configured": bool((settings.grafana_url or "").strip()), "dashboard_url": dash},
+        "grafana": {"configured": grafana_configured, "dashboard_url": dash},
     }
 
 
-async def _fetch_real_logs(service: str, created_at, run_id: str | None = None) -> dict:
+async def _fetch_real_logs(service: str, created_at, run_id: str | None = None,
+                         db: Session | None = None, org_id: str | None = None) -> dict:
     """Query the real log provider over the last 60 minutes.
 
     Window ends at the incident's created_at when available, else now.
@@ -135,18 +178,29 @@ async def _fetch_real_logs(service: str, created_at, run_id: str | None = None) 
     time window. Never raises: a failure is reported as available=False
     with an error, and the caller records an integration_unavailable
     evidence item.
+
+    Phase 7: with ``db`` given, the org's log provider is used
+    (``search_logs_real_for_org`` — per-org credentials, else the global
+    provider); without ``db`` the pre–Phase 7 global path is used.
     """
     end = created_at or datetime.now(timezone.utc)
     if end.tzinfo is None:
         end = end.replace(tzinfo=timezone.utc)
     start = end - timedelta(minutes=60)
     try:
-        provider_name = get_log_provider().provider_name
+        if db is not None:
+            provider_name = get_log_provider_for_org(db, org_id).provider_name
+        else:
+            provider_name = get_log_provider().provider_name
     except Exception:
         provider_name = "none"
     try:
-        error_res = await search_logs_real(service, start, end, level="error", limit=50, run_id=run_id)
-        warn_res = await search_logs_real(service, start, end, level="warn", limit=50, run_id=run_id)
+        if db is not None:
+            error_res = await search_logs_real_for_org(db, org_id, service, start, end, level="error", limit=50, run_id=run_id)
+            warn_res = await search_logs_real_for_org(db, org_id, service, start, end, level="warn", limit=50, run_id=run_id)
+        else:
+            error_res = await search_logs_real(service, start, end, level="error", limit=50, run_id=run_id)
+            warn_res = await search_logs_real(service, start, end, level="warn", limit=50, run_id=run_id)
     except Exception as exc:  # pragma: no cover - search_logs_real already guards
         # search_logs_real only converts LogProviderError into a result dict;
         # anything else (e.g. httpx.InvalidURL from proxy env parsing) still
@@ -181,7 +235,8 @@ async def _fetch_real_logs(service: str, created_at, run_id: str | None = None) 
             "groups": groups, "error": error}
 
 
-async def _fetch_real_metrics(service: str, run_id: str | None = None) -> dict | None:
+async def _fetch_real_metrics(service: str, run_id: str | None = None,
+                            db: Session | None = None, org_id: str | None = None) -> dict | None:
     """Query Prometheus for all five service metrics.
 
     Returns None when Prometheus is not configured. Per-metric failures are
@@ -190,8 +245,15 @@ async def _fetch_real_metrics(service: str, run_id: str | None = None) -> dict |
     ``run_id`` scopes the embedded provider to one simulation run (the
     incident's external_id); the external Prometheus client ignores it
     and queries by time window.
+
+    Phase 7: with ``db`` given, the org's Prometheus client is used
+    (per-org credentials, else the global client); without ``db`` the
+    pre–Phase 7 global path is used.
     """
-    client = get_prometheus_client()
+    if db is not None:
+        client = get_prometheus_client_for_org(db, org_id)
+    else:
+        client = get_prometheus_client()
     if client is None:
         return None
     try:
@@ -302,7 +364,10 @@ async def run_investigation(db: Session, incident: Incident) -> dict:
     demo_mode = settings.demo_mode
     incident.status = "investigating"
     db.commit()
-    integrations = _integration_config(incident.service)
+    # Phase 7 — resolve the incident's org once; every integration
+    # lookup below uses it (per-org credentials, global fallback).
+    org_id = _resolve_incident_org_id(db, incident)
+    integrations = _integration_config(incident.service, db=db, org_id=org_id)
     _event(db, incident.id, "agent", "supervisor", {"message": "Investigation started", "demo_mode": demo_mode,
             "model": "demo" if demo_mode else settings.groq_model, "integrations": integrations})
 
@@ -327,8 +392,22 @@ async def run_investigation(db: Session, incident: Incident) -> dict:
             # run_id is the incident's external_id: the embedded provider
             # reads only THIS run's emitted telemetry (Phase 6), so one
             # eval case's signals can never leak into another's.
-            result = await _fetch_real_logs(incident.service, incident.created_at,
-                                            run_id=incident.external_id)
+            # Phase 7: the org's log provider is used (per-org credentials,
+            # else the global provider). Compatibility: test doubles may
+            # still patch module-level ``_fetch_real_logs`` with the old
+            # 3-arg signature — a TypeError naming an unexpected keyword
+            # argument retries once with the old signature instead of
+            # failing the investigation (the double raised before doing
+            # any work, so the retry is safe).
+            try:
+                result = await _fetch_real_logs(incident.service, incident.created_at,
+                                                run_id=incident.external_id,
+                                                db=db, org_id=org_id)
+            except TypeError as exc:
+                if "unexpected keyword argument" not in str(exc):
+                    raise
+                result = await _fetch_real_logs(incident.service, incident.created_at,
+                                                run_id=incident.external_id)
             entries = result.get("entries") or []
             out = {"tool": "search_logs", "service": incident.service,
                    "count": len(entries),
@@ -349,7 +428,15 @@ async def run_investigation(db: Session, incident: Incident) -> dict:
         if not demo_mode:
             # run_id scopes the embedded provider to this incident's run
             # (see logs_agent above); external Prometheus ignores it.
-            real = await _fetch_real_metrics(incident.service, run_id=incident.external_id)
+            # Phase 7: the org's Prometheus client is used (see the
+            # compatibility note in logs_agent for the TypeError retry).
+            try:
+                real = await _fetch_real_metrics(incident.service, run_id=incident.external_id,
+                                                 db=db, org_id=org_id)
+            except TypeError as exc:
+                if "unexpected keyword argument" not in str(exc):
+                    raise
+                real = await _fetch_real_metrics(incident.service, run_id=incident.external_id)
             baseline = SERVICE_STATE.get(incident.service, {})
             if real is None:
                 out = {"tool": "get_metrics", "service": incident.service,

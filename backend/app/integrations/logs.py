@@ -401,6 +401,53 @@ def get_log_provider() -> LogProvider:
     return EmbeddedLogProvider()
 
 
+def get_log_provider_for_org(db, org_id: str | None, transport: Any = None) -> LogProvider:
+    """Phase 7 — per-org log provider.
+
+    When the org has an active ``logs`` integration, build the provider
+    named by its ``provider`` field (``elasticsearch`` | ``opensearch``,
+    also accepted in ``config["provider"]``) from config (``url``,
+    ``index``) + secrets (Elasticsearch: ``api_key`` / ``token``;
+    OpenSearch: ``auth`` / ``api_key`` / ``token``). Otherwise fall back
+    to the global provider (:func:`get_log_provider`, which is the
+    external provider when configured, else the Phase 6 embedded
+    provider). Never returns ``NoLogProvider`` via the fallback path —
+    the embedded provider is the default when nothing external is
+    configured. ``org_id`` None means "no org resolved": straight to the
+    global fallback. ``transport`` is a test hook (httpx.MockTransport).
+    """
+    if org_id:
+        try:
+            from ..org_integrations import get_org_integration_decrypted
+            integ = get_org_integration_decrypted(db, org_id, "logs")
+        except Exception:
+            integ = None
+        if integ:
+            config = integ.get("config") or {}
+            secrets = integ.get("secrets") or {}
+            url = (config.get("url") or config.get("base_url") or "").strip()
+            index = (config.get("index") or "").strip() or None
+            provider = ((integ.get("provider") or config.get("provider") or "").strip().lower())
+            if url and provider == "elasticsearch":
+                return ElasticsearchProvider(
+                    base_url=url,
+                    api_key=(secrets.get("api_key") or secrets.get("token") or "").strip() or None,
+                    index=index, transport=transport)
+            if url and provider == "opensearch":
+                return OpenSearchProvider(
+                    base_url=url,
+                    auth=(secrets.get("auth") or secrets.get("api_key") or secrets.get("token") or "").strip() or None,
+                    index=index, transport=transport)
+            if url:
+                # Provider name missing/unknown: default to Elasticsearch
+                # (the precedence the global selector uses).
+                return ElasticsearchProvider(
+                    base_url=url,
+                    api_key=(secrets.get("api_key") or secrets.get("token") or "").strip() or None,
+                    index=index, transport=transport)
+    return get_log_provider()
+
+
 # --- Aggregation / evidence ------------------------------------------------
 def _normalise_message(message: str) -> str:
     return re.sub(r"\s+", " ", message.strip().lower())
@@ -467,27 +514,12 @@ def to_evidence(entries: list[LogEntry], groups: list[dict], provider: str = "")
     return items
 
 
-async def search_logs_real(
-    service: str,
-    start: "str | datetime",
-    end: "str | datetime",
-    level: str = "error",
-    limit: int = 50,
-    run_id: str | None = None,
-) -> dict:
-    """Search real logs via the configured provider.
-
-    Returns {"provider", "available", "entries", "groups", "error"}.
-    ``available`` is False (with ``error`` set and ``entries`` empty) when
-    the provider is unreachable — entries are never fabricated in that
-    case. With no external provider configured the Phase 6 embedded
-    provider answers from the simulated services' own telemetry (which
-    may legitimately be empty: ``available`` True, ``entries`` []).
-
-    ``run_id`` scopes the search to one simulation run (the incident's
-    external_id); external providers ignore it and query by time window.
-    """
-    provider = get_log_provider()
+async def _search_with_provider(provider: LogProvider, service: str,
+                              start: "str | datetime", end: "str | datetime",
+                              level: str = "error", limit: int = 50,
+                              run_id: str | None = None) -> dict:
+    """Search via an already-resolved provider (shared by
+    :func:`search_logs_real` and :func:`search_logs_real_for_org`)."""
     if isinstance(provider, NoLogProvider):
         return {
             "provider": provider.provider_name,
@@ -519,3 +551,47 @@ async def search_logs_real(
         "groups": groups,
         "error": None,
     }
+
+
+async def search_logs_real(
+    service: str,
+    start: "str | datetime",
+    end: "str | datetime",
+    level: str = "error",
+    limit: int = 50,
+    run_id: str | None = None,
+) -> dict:
+    """Search real logs via the configured provider.
+
+    Returns {"provider", "available", "entries", "groups", "error"}.
+    ``available`` is False (with ``error`` set and ``entries`` empty) when
+    the provider is unreachable — entries are never fabricated in that
+    case. With no external provider configured the Phase 6 embedded
+    provider answers from the simulated services' own telemetry (which
+    may legitimately be empty: ``available`` True, ``entries`` []).
+
+    ``run_id`` scopes the search to one simulation run (the incident's
+    external_id); external providers ignore it and query by time window.
+    """
+    return await _search_with_provider(get_log_provider(), service, start, end,
+                                       level=level, limit=limit, run_id=run_id)
+
+
+async def search_logs_real_for_org(
+    db,
+    org_id: str | None,
+    service: str,
+    start: "str | datetime",
+    end: "str | datetime",
+    level: str = "error",
+    limit: int = 50,
+    run_id: str | None = None,
+    transport: Any = None,
+) -> dict:
+    """Phase 7 — :func:`search_logs_real` via the org's log provider
+    (:func:`get_log_provider_for_org`, falling back to the global
+    provider when the org has none). Same return shape as
+    :func:`search_logs_real`."""
+    provider = get_log_provider_for_org(db, org_id, transport=transport)
+    return await _search_with_provider(provider, service, start, end,
+                                       level=level, limit=limit, run_id=run_id)
