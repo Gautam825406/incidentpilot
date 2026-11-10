@@ -30,7 +30,7 @@ class GroqClient:
     async def chat_json(self, system: str, user: str, timeout: float = 25.0) -> dict:
         """Ask Groq for a JSON object. Returns {data, tokens, cost_usd, latency_ms, model}."""
         started = time.time()
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             resp = await client.post(
                 f"{settings.groq_base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},

@@ -404,3 +404,28 @@ def test_migration_adds_missing_hypothesis_columns(tmp_path):
     row = session.query(Hypothesis).first()
     assert row.alternatives == ["a"] and row.next_steps == ["s"]
     session.close()
+
+# --- Groq failure instrumentation (live-mode diagnosis) ---
+import asyncio
+from app import agents as agents_mod
+
+def test_groq_failure_is_recorded_not_silent(monkeypatch):
+    """A failing Groq call in live mode must surface its error, not silently fall back."""
+    async def _fake_groq(*a, **k):
+        return {"_error": "401 Client Error: Unauthorized for url: https://api.groq.com/openai/v1/chat/completions"}
+    monkeypatch.setattr(agents_mod, "_groq_hypothesis", _fake_groq)
+    from app.database import SessionLocal
+    from app.models import Incident, IncidentEvent
+    from app.synthetic import get_scenario
+    db = SessionLocal()
+    sc = get_scenario("checkout-oom")
+    inc = Incident(title=sc["title"], service=sc["service"], severity=sc["severity"], source="test", external_id="groq-fail-1", scenario="checkout-oom")
+    db.add(inc); db.commit(); db.refresh(inc)
+    # force live mode for this test: demo_mode is a property derived from the key
+    monkeypatch.setattr(agents_mod.settings, "groq_api_key", "gsk_test_key_for_test_only")
+    assert agents_mod.settings.demo_mode is False
+    out = asyncio.run(agents_mod.run_investigation(db, inc))
+    assert out.get("groq_error") and "401" in out["groq_error"]
+    evs = db.query(IncidentEvent).filter_by(incident_id=inc.id, type="groq_failed").all()
+    assert len(evs) == 1 and "401" in str(evs[0].payload.get("error", ""))
+    assert "gsk_" not in out["groq_error"]

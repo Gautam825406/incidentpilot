@@ -132,10 +132,15 @@ def _agent_run(db: Session, incident_id: str, agent: str, model: str, tokens: in
 
 
 async def _groq_hypothesis(incident: Incident, scenario: dict, evidence_text: str) -> dict | None:
-    """Live LLM step. Returns parsed JSON or None on any failure (caller falls back)."""
+    """Live LLM step. Returns parsed JSON, or {"_error": ...} on failure (caller falls back).
+
+    The error is a short, sanitised HTTP/status message only — it never contains
+    the API key. Previously this swallowed the error entirely, so a failing Groq
+    key looked identical to a working one in the eval numbers.
+    """
     client = GroqClient()
     if not client.available:
-        return None
+        return {"_error": "no Groq API key configured"}
     try:
         result = await client.chat_json(
             system="You are a site reliability engineer investigating a production incident. "
@@ -145,8 +150,10 @@ async def _groq_hypothesis(incident: Incident, scenario: dict, evidence_text: st
             user=f"Service: {incident.service}\nAlert: {incident.title}\nEvidence:\n{evidence_text}",
         )
         return {**result["data"], "_tokens": result["tokens"], "_cost": result["cost_usd"], "_latency": result["latency_ms"], "_model": result["model"]}
-    except Exception:
-        return None
+    except Exception as exc:
+        # httpx error text carries status + URL, never the Authorization header.
+        msg = str(exc).replace(client.api_key or "", "[redacted]")[:300]
+        return {"_error": msg or "Groq request failed"}
 
 
 def _deterministic_hypothesis(incident: Incident, scenario: dict, logs_out: dict, metrics_out: dict, kb_out: dict) -> dict:
@@ -358,6 +365,12 @@ async def run_investigation(db: Session, incident: Incident) -> dict:
     evidence_text = "\n".join(e.content for e in db.query(Evidence).filter_by(incident_id=incident.id).all())
     llm = await _groq_hypothesis(incident, scenario, evidence_text) if not demo_mode else None
     tokens = cost = 0
+    groq_error = (llm or {}).get("_error") if llm else None
+    if groq_error:
+        # Record the real failure reason on the incident timeline so a live
+        # run can be diagnosed from the API instead of guessing from numbers.
+        _event(db, incident.id, "groq_failed", "supervisor",
+               {"message": "Groq LLM call failed — deterministic fallback used", "error": groq_error})
     if llm and llm.get("root_cause"):
         hyp = {"root_cause": llm["root_cause"], "confidence": float(llm.get("confidence", 0.0)),
                "tool": llm.get("tool", "none"), "abstain": float(llm.get("confidence", 0.0)) < ABSTAIN_CONFIDENCE,
@@ -396,7 +409,8 @@ async def run_investigation(db: Session, incident: Incident) -> dict:
         _event(db, incident.id, "hypothesis", "supervisor", {"message": "Abstained — insufficient evidence", "confidence": hyp.get("confidence", 0.0),
                                                              "integrations": integrations})
         return {"incident_id": incident.id, "status": "abstained", "demo_mode": demo_mode,
-                "integrations": integrations, "hypotheses": [], "tokens": tokens, "cost_usd": cost}
+                "integrations": integrations, "hypotheses": [], "tokens": tokens, "cost_usd": cost,
+                "groq_error": groq_error}
 
     # Remediation plan — only from the allow-listed tool the evidence supports.
     tool = hyp.get("tool") or "none"
@@ -435,7 +449,7 @@ async def run_investigation(db: Session, incident: Incident) -> dict:
     db.commit()
     _event(db, incident.id, "hypothesis", "supervisor", {"message": "Remediation plan proposed — awaiting human approval", "plan_id": plan.id, "steps": steps})
     return {"incident_id": incident.id, "status": "awaiting_approval", "demo_mode": demo_mode,
-            "integrations": integrations,
+            "integrations": integrations, "groq_error": groq_error,
             "hypotheses": [{"statement": h.statement, "confidence": h.confidence,
                             "evidence_ids": h.evidence_ids or [],
                             "related_previous_incidents": related_previous,
