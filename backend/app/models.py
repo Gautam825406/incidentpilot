@@ -90,6 +90,10 @@ class Hypothesis(Base):
     confidence = Column(Float, default=0.0)
     status = Column(String, default="proposed")
     evidence_ids = Column(JSON, default=list)
+    # Phase 6 — hypothesis record enrichment (JSON lists, default empty).
+    related_previous_incidents = Column(JSON, default=list)  # [{title, kind}] postmortems from Knowledge agent
+    alternatives = Column(JSON, default=list)  # alternative explanation texts, or a note when none is supported
+    next_steps = Column(JSON, default=list)  # recommended next steps (remediation plan / runbook descriptions)
     created_at = Column(DateTime, default=_now)
     updated_at = Column(DateTime, default=_now, onupdate=_now)
 

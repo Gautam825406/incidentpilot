@@ -21,6 +21,26 @@ class Settings(BaseSettings):
     confidence_threshold: float = 0.65
     plan_expiry_minutes: int = 30
     cors_origins: str = "*"
+    # Phase 2 — Prometheus (optional; empty = not configured, demo mode unaffected)
+    prometheus_url: str = ""
+    prometheus_auth_token: str = ""
+    prometheus_timeout: float = 10.0
+    # Grafana (optional; dashboards is a JSON object mapping service -> dashboard path/UID)
+    grafana_url: str = ""
+    grafana_dashboards: str = ""
+    # Phase 4 — real log providers (optional; empty = not configured).
+    # Elasticsearch takes precedence over OpenSearch when both are set.
+    elasticsearch_url: str = ""
+    elasticsearch_api_key: str = ""
+    elasticsearch_index: str = "logs-*"
+    opensearch_url: str = ""
+    opensearch_auth: str = ""
+    opensearch_index: str = "logs-*"
+    # Phase 8 — optional shared secret for /api/webhooks/alert. Empty
+    # (default) keeps the demo behaviour: the webhook is open. When set,
+    # callers must send header X-Alert-Token with this value (constant-time
+    # compare); without it the webhook returns 401. See main.py.
+    alert_webhook_secret: str = ""
 
     @property
     def demo_mode(self) -> bool:

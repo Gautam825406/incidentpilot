@@ -39,4 +39,5 @@ export const api = {
   evalResults: () => req("/api/evals/results"),
   runEval: () => req("/api/evals/run", { method: "POST", headers: headers() }),
   documents: () => req("/api/documents"),
+  integrationsStatus: () => req("/api/integrations/status"),
 };

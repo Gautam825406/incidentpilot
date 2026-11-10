@@ -21,6 +21,29 @@ class SimulateIn(BaseModel):
     scenario: str = "checkout-oom"
 
 
+class AlertmanagerAlert(BaseModel):
+    """One alert inside a Prometheus Alertmanager webhook payload (Phase 3)."""
+    status: str = "firing"  # firing | resolved
+    labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
+    startsAt: Optional[str] = None
+    endsAt: Optional[str] = None
+    fingerprint: Optional[str] = None
+    generatorURL: Optional[str] = None
+
+
+class AlertmanagerPayload(BaseModel):
+    """Top-level Prometheus Alertmanager webhook payload (Phase 3)."""
+    version: Optional[str] = None
+    groupKey: Optional[str] = None
+    status: Optional[str] = None
+    receiver: Optional[str] = None
+    groupLabels: dict[str, str] = Field(default_factory=dict)
+    commonLabels: dict[str, str] = Field(default_factory=dict)
+    commonAnnotations: dict[str, str] = Field(default_factory=dict)
+    alerts: list[AlertmanagerAlert] = Field(default_factory=list)
+
+
 class PlanEditIn(BaseModel):
     steps: list[dict] = Field(default_factory=list)
 

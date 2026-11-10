@@ -1,0 +1,18 @@
+# Minimal Prometheus config for the optional `monitoring` compose profile.
+# It scrapes itself only. Point it at your real services by adding jobs
+# that expose Prometheus metrics, e.g.:
+#
+#   - job_name: 'checkout-api'
+#     static_configs:
+#       - targets: ['checkout-api:8000']
+#
+# IncidentPilot only needs read access: it issues GET /api/v1/query
+# (PromQL) for the metrics in backend/app/integrations/prometheus.py.
+# No recording rules or alerting rules are required for the integration.
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

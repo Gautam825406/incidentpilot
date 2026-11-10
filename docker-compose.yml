@@ -14,6 +14,13 @@ services:
     environment:
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       DATABASE_URL: postgresql://incidentpilot:incidentpilot@postgres:5432/incidentpilot
+      # Optional integrations (empty = not configured). When running with
+      # the `monitoring` profile, set PROMETHEUS_URL=http://prometheus:9090
+      # (see README "Prometheus setup").
+      PROMETHEUS_URL: ${PROMETHEUS_URL:-}
+      GRAFANA_URL: ${GRAFANA_URL:-}
+      ELASTICSEARCH_URL: ${ELASTICSEARCH_URL:-}
+      OPENSEARCH_URL: ${OPENSEARCH_URL:-}
     ports:
       - "8000:8000"
     depends_on:
@@ -28,5 +35,20 @@ services:
       - "5173:5173"
     depends_on:
       - backend
+  # Optional local Prometheus — only started with the `monitoring` profile,
+  # so the default `docker compose up` is unchanged:
+  #   PROMETHEUS_URL=http://prometheus:9090 docker compose --profile monitoring up --build
+  # Then point it at your services by adding scrape jobs to prometheus.yml.
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: ["monitoring"]
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
 volumes:
   pgdata:
+  promdata:

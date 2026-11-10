@@ -85,3 +85,17 @@ button.big{padding:13px 22px;font-size:15px}
   .feature-grid{grid-template-columns:1fr 1fr}
 }
 @media(max-width:560px){.feature-grid{grid-template-columns:1fr}.landing-nav nav{display:none}}
+
+/* --- Phase 7: Monitoring Connections + Live Incident Dashboard --- */
+.conn-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:14px}
+.conn-card{background:#0d1828;border:1px solid var(--border);border-radius:12px;padding:14px;display:grid;gap:8px;align-content:start}
+.conn-card strong{font-size:15px}
+.conn-card .badge{justify-self:start}
+.live-table th{white-space:nowrap}
+.live-table td{vertical-align:top}
+.live-table button{padding:5px 11px;font-size:13px}
+.conf{font-size:17px;font-weight:800;letter-spacing:-.01em}
+@media(max-width:900px){
+  .conn-grid{grid-template-columns:1fr}
+  .live-table{font-size:13px}
+}

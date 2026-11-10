@@ -7,22 +7,28 @@ Routes: /api/health, /api/auth/login, /api/webhooks/alert, /api/simulate,
 in the demo so a recruiter can browse without an account.
 """
 import asyncio
+import hashlib
+import hmac
 import json
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from .agents import build_graph, run_investigation
 from .config import settings
 from .database import SessionLocal, get_db, init_db
 from .executor import execute_plan, postmortem_draft, verify_recovery
+from .integrations.grafana import dashboard_url, grafana_status
+from .integrations.logs import get_log_provider
+from .integrations.prometheus import PrometheusClient
 from .llm import hash_embedding
 from .models import AgentRun, Document, EvalRun, Evidence, Hypothesis, Incident, IncidentEvent, RemediationPlan, User
-from .schemas import AlertIn, DocumentIn, ExecuteIn, LoginIn, PlanEditIn, RejectIn, SimulateIn, incident_out
+from .schemas import AlertIn, AlertmanagerPayload, DocumentIn, ExecuteIn, LoginIn, PlanEditIn, RejectIn, SimulateIn, incident_out
 from .security import create_token, verify_password, verify_token
 from .seed import seed
 from .synthetic import SERVICE_STATE, get_scenario, list_scenarios
@@ -67,10 +73,23 @@ def _detail(db: Session, incident: Incident) -> dict:
     plans = db.query(RemediationPlan).filter_by(incident_id=incident.id).order_by(RemediationPlan.created_at.desc()).all()
     runs = db.query(AgentRun).filter_by(incident_id=incident.id).all()
     plan = plans[0] if plans else None
+    # Monitoring links/config for this incident's service. Guarded so a
+    # failing integration helper can never break the detail response.
+    try:
+        monitoring = {
+            "grafana_dashboard_url": dashboard_url(incident.service),
+            "prometheus_configured": bool((settings.prometheus_url or "").strip()),
+            "logs_provider": get_log_provider().provider_name,
+        }
+    except Exception:
+        monitoring = {"grafana_dashboard_url": None, "prometheus_configured": False, "logs_provider": "none"}
     return {
         **incident_out(incident),
         "demo_mode": settings.demo_mode,
-        "hypotheses": [{"id": h.id, "rank": h.rank, "statement": h.statement, "confidence": h.confidence, "status": h.status, "evidence_ids": h.evidence_ids or []} for h in hyps],
+        "monitoring": monitoring,
+        "hypotheses": [{"id": h.id, "rank": h.rank, "statement": h.statement, "confidence": h.confidence, "status": h.status, "evidence_ids": h.evidence_ids or [],
+                        "related_previous_incidents": h.related_previous_incidents or [],
+                        "alternatives": h.alternatives or [], "next_steps": h.next_steps or []} for h in hyps],
         "evidence": [{"id": e.id, "kind": e.kind, "source_ref": e.source_ref, "content": e.content} for e in evs],
         "events": [{"id": e.id, "type": e.type, "actor": e.actor, "payload": e.payload, "created_at": e.created_at.isoformat() if e.created_at else None} for e in events],
         "plan": {"id": plan.id, "steps": plan.steps, "risk": plan.risk, "rollback": plan.rollback, "status": plan.status,
@@ -102,7 +121,32 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
 
 
 @app.post("/api/webhooks/alert")
-async def webhook(body: AlertIn, db: Session = Depends(get_db)):
+async def webhook(request: Request, db: Session = Depends(get_db)):
+    """Accept both shapes (Phase 3):
+    - the original AlertIn JSON {title, service, severity, source, external_id}
+      — behaviour unchanged from v1;
+    - a Prometheus Alertmanager payload, detected by the "alerts" key.
+
+    Optional shared-secret auth (Phase 8): when ALERT_WEBHOOK_SECRET is
+    set, callers must send it as header ``X-Alert-Token`` or the webhook
+    returns 401. When unset (the demo default) the webhook stays open so
+    Alertmanager needs no extra configuration.
+    """
+    secret = (settings.alert_webhook_secret or "").strip()
+    if secret and not hmac.compare_digest(request.headers.get("x-alert-token", ""), secret):
+        raise HTTPException(status_code=401, detail="Missing or invalid X-Alert-Token header")
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid alert payload: body must be JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="Invalid alert payload: body must be a JSON object")
+    if "alerts" in payload:
+        return await _webhook_alertmanager(payload, db)
+    try:
+        body = AlertIn.model_validate(payload)
+    except ValidationError:
+        raise HTTPException(status_code=422, detail="Invalid alert payload: title and service are required")
     ext = body.external_id or f"alert-{uuid.uuid4().hex[:8]}"
     existing = db.query(Incident).filter_by(external_id=ext).first()
     if existing:
@@ -112,6 +156,105 @@ async def webhook(body: AlertIn, db: Session = Depends(get_db)):
     _event(db, inc.id, "alert", body.source, {"title": body.title, "service": body.service, "severity": body.severity})
     asyncio.create_task(_run_bg(inc.id))
     return {"incident_id": inc.id, "deduplicated": False, **incident_out(inc)}
+
+
+_SEVERITY_MAP = {
+    "critical": "P1", "page": "P1", "p1": "P1",
+    "warning": "P2", "major": "P2", "high": "P2", "p2": "P2",
+    "info": "P3", "minor": "P3", "low": "P3", "p3": "P3",
+}
+
+
+def _am_severity(labels: dict) -> str:
+    return _SEVERITY_MAP.get(str(labels.get("severity", "")).strip().lower(), "P3")
+
+
+def _am_external_id(alert) -> str:
+    if alert.fingerprint:
+        return str(alert.fingerprint)
+    digest = hashlib.sha256(json.dumps(
+        {"labels": alert.labels, "annotations": alert.annotations, "startsAt": alert.startsAt},
+        sort_keys=True, default=str).encode()).hexdigest()[:16]
+    return f"am-{digest}"
+
+
+async def _webhook_alertmanager(payload: dict, db: Session) -> dict:
+    try:
+        body = AlertmanagerPayload.model_validate(payload)
+    except ValidationError:
+        raise HTTPException(status_code=422, detail="Invalid Alertmanager payload: alerts must be a list of alert objects")
+    if not body.alerts:
+        raise HTTPException(status_code=422, detail="Invalid Alertmanager payload: alerts list is empty")
+    created_ids: list[str] = []
+    dedup_ids: list[str] = []
+    skipped_resolved = 0
+    for alert in body.alerts:
+        if str(alert.status).lower() == "resolved":
+            skipped_resolved += 1
+            continue
+        labels = dict(body.commonLabels or {})
+        labels.update(alert.labels or {})
+        annotations = dict(body.commonAnnotations or {})
+        annotations.update(alert.annotations or {})
+        service = labels.get("service") or labels.get("job") or labels.get("instance") or "unknown"
+        severity = _am_severity(labels)
+        title = annotations.get("summary") or labels.get("alertname") or "Alertmanager alert"
+        description = annotations.get("description") or annotations.get("summary") or ""
+        ext = _am_external_id(alert)
+        existing = db.query(Incident).filter_by(external_id=ext).first()
+        if existing and existing.status != "resolved":
+            dedup_ids.append(existing.id)
+            continue
+        if existing and existing.status == "resolved":
+            # external_id is unique: a re-firing alert for a resolved incident
+            # gets a fresh id so the new incident can be created.
+            ext = f"{ext}-{uuid.uuid4().hex[:8]}"
+        inc = Incident(title=title, service=service, severity=severity,
+                       source="alertmanager", external_id=ext, scenario="")
+        db.add(inc); db.commit(); db.refresh(inc)
+        _event(db, inc.id, "alert", "alertmanager",
+               {"title": title, "service": service, "severity": severity,
+                "alertname": labels.get("alertname", ""), "description": description,
+                "fingerprint": alert.fingerprint or ""})
+        asyncio.create_task(_run_bg(inc.id))
+        created_ids.append(inc.id)
+    if created_ids:
+        return {"acknowledged": True, "deduplicated": False, "incident_id": created_ids[0],
+                "incident_ids": created_ids, "deduplicated_ids": dedup_ids,
+                "skipped_resolved": skipped_resolved}
+    if dedup_ids:
+        return {"acknowledged": True, "deduplicated": True, "incident_id": dedup_ids[0],
+                "incident_ids": [], "deduplicated_ids": dedup_ids,
+                "skipped_resolved": skipped_resolved}
+    return {"acknowledged": True, "deduplicated": False, "incident_id": None,
+            "incident_ids": [], "deduplicated_ids": [],
+            "skipped_resolved": skipped_resolved}
+
+
+@app.get("/api/integrations/status")
+async def integrations_status():
+    """Phase 2/3/4 status: Prometheus (live health check when configured),
+    logs (configured provider, via get_log_provider), Grafana links.
+    No tokens or secrets are ever included in this response."""
+    prom_url = (settings.prometheus_url or "").strip() or None
+    prom_configured = bool(prom_url)
+    prom_reachable: bool | None = None
+    if prom_configured:
+        # Live health check, capped at a short timeout so /status stays fast.
+        client = PrometheusClient(timeout=min(settings.prometheus_timeout, 5.0))
+        try:
+            prom_reachable = (await client.health())["reachable"]
+        except Exception:
+            prom_reachable = False
+    try:
+        logs_provider = get_log_provider().provider_name
+    except Exception:
+        logs_provider = "none"
+    return {
+        "prometheus": {"configured": prom_configured, "reachable": prom_reachable, "url": prom_url},
+        "logs": {"provider": logs_provider, "configured": logs_provider != "none"},
+        "grafana": grafana_status(),
+    }
 
 
 async def _run_bg(incident_id: str):
