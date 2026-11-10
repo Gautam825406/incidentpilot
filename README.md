@@ -297,7 +297,11 @@ Other endpoints: `GET /api/incidents`, `GET /api/scenarios`, `POST /api/incident
 ```bash
 cd backend && python -m evals.run_eval   # writes backend/evals/results.json
 ```
-Golden set: 6 synthetic cases (5 root causes + 1 abstain case). Metrics: top-1 accuracy, evidence coverage, abstention correctness, unsafe actions (target 0), latency. **No results are fabricated** — see `backend/evals/results.json` after a run; the table below is filled in only after you run it.
+Golden set: 6 synthetic cases (5 root causes + 1 abstain case). Metrics: top-1 accuracy (exact and semantic), evidence coverage, abstention correctness, unsafe actions (target 0), latency. **No results are fabricated** — see `backend/evals/results.json` after a run; the table below is filled in only after you run it.
+
+**Phase 5 — live LLM abstention fix (2026-11-10/11).** The true live eval (model `openai/gpt-oss-120b`, run dbd04041) showed the live LLM hallucinating a memory leak at 0.95 confidence on the unknown-signal case instead of abstaining. Two fixes: (1) the supervisor prompt now forbids inventing deploy versions/details not in the evidence and requires abstention when evidence names no specific root cause — a runbook about a similar past incident is not evidence this incident has the same cause; (2) a deterministic server-side guard after the LLM returns: if usable evidence is only knowledge-base docs (no log/metric evidence), or the scenario has no known root cause, the run abstains unless at least 2 distinctive words of the proposed root cause appear in usable log/metric evidence. The 0.65 threshold is unchanged, and the demo deterministic path is unchanged. Honest trade-off: with no log provider/Prometheus configured, live runs will abstain — top-1 stays 0 until real log/metric evidence is wired up. That is the intended behaviour, not a bug.
+
+**Phase 5 — semantic eval.** Exact-string matching scored the live LLM 0/6 even when it was semantically right in 3/5 cases, so the harness now records both: exact top-1 (kept, secondary) and semantic top-1 via a deterministic mechanism-keyword scorer (memory leak/OOM, connection pool, cache miss, TLS certificate expired, CPU saturation; strong phrase = 1 hit, ≥2 weak keywords required; tied top mechanisms = ambiguous, no hit). No LLM judge — fully reproducible, no extra Groq calls. Both metrics, plus tokens/cost per case, are recorded in `results.json` and the EvalRun DB row.
 
 Measured 2026-11-10 (demo mode, no Groq key — re-run with a key for live-LLM numbers):
 
@@ -309,11 +313,11 @@ Measured 2026-11-10 (demo mode, no Groq key — re-run with a key for live-LLM n
 | Abstention correctness | **1/1** (unknown-signal case) |
 | Median time-to-hypothesis | 1983 ms |
 
-Full per-case table: `backend/evals/results.json`. These are demo-mode numbers, not live-LLM results.
+Full per-case table: `backend/evals/results.json`. These are demo-mode numbers, not live-LLM results. The true live eval before Phase 5 (run dbd04041, `openai/gpt-oss-120b`, 2026-11-10): exact top-1 0/6, abstention 0/1, evidence 1.0, unsafe 0, median 1170 ms — re-run after Phase 5 for the new live numbers; see the eval section below for the latest live run.
 
 ## Testing
 ```bash
-cd backend && .venv/bin/python -m pytest tests -q   # 99 tests, all mocked — no real infra needed
+cd backend && .venv/bin/python -m pytest tests -q   # 117 tests, all mocked — no real infra needed
 ```
 Coverage: API end-to-end (simulate → approve → dry-run → execute → verify), executor allow-list/idempotency, tools, log providers (parse / zero-hits / connection failure / invalid shape / 5xx retry / grouping), Prometheus (health success / connection failure / invalid response / timeout / missing metric), Alertmanager webhook (valid / duplicate fingerprint / invalid 422 / resolved skipped / legacy shape / optional shared secret), integrations status, live-mode Groq-down guard, confidence threshold, the schema migration (old-DB file gains the Phase 6 columns), Phase 3 Jira/Slack (create success + priority mapping, missing config, invalid response, 4xx fail-fast, timeout/5xx retry, status transitions, Slack post success/failure/timeout, message content, notify endpoint auth/role/404/422/503/502, idempotent re-notify, status endpoint includes jira/slack with no secrets), and Phase 4 Step 2 hardening (per-user random password salts + legacy fixed-salt hashes still verifying, CORS allow-list parsing, JWT_SECRET fail-loud validation, login/webhook rate limiting incl. 429, background worker completing a webhook investigation readable via GET, Postgres URL recognition + `postgres://` normalisation with the SQLite fallback intact). The rate limiters stay ON in tests and are reset between tests by `tests/conftest.py`; disable them entirely with `RATE_LIMIT_ENABLED=false`.
 

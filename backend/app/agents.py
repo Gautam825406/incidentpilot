@@ -7,7 +7,7 @@ in parallel (asyncio.gather) and persists every step to the DB.
 
 Two modes:
 - Live (GROQ_API_KEY set): Triage/Logs/Metrics/Knowledge call Groq
-  llama-3.3-70b-versatile and return structured JSON; the supervisor merges
+  openai/gpt-oss-120b and return structured JSON; the supervisor merges
   and enforces citation coverage.
 - Demo (no key): deterministic fixture-based reasoning over the synthetic
   scenario — labelled demo_mode everywhere. It never pretends to be an LLM.
@@ -21,6 +21,7 @@ source — values are never invented. Demo mode keeps using the synthetic
 fixtures, labelled demo/synthetic.
 """
 import asyncio
+import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -37,8 +38,40 @@ from .security import sanitise_evidence
 from .synthetic import SCENARIOS, SERVICE_STATE, get_scenario
 from .tools import KnowledgeInput, MetricsInput, SearchLogsInput, get_error_clusters, get_metrics, search_knowledge, search_logs
 
-PROMPT_VERSION = "v1"
+PROMPT_VERSION = "v2"
 ABSTAIN_CONFIDENCE = settings.confidence_threshold
+
+# Phase 5 abstention guard — words too generic to count as direct support
+# for a proposed root cause (service names, "deploy", "error", ...). A
+# root cause is only "directly supported" when distinctive words from it
+# appear in log/metric evidence from THIS incident.
+_GUARD_STOPWORDS = frozenset({
+    "service", "error", "errors", "failure", "failed", "issue", "problem",
+    "incident", "alert", "check", "deploy", "deployed", "introduced",
+    "causing", "caused", "after", "with", "from", "that", "this", "when",
+    "into", "high", "rising", "spike", "slow", "unknown", "java", "lang",
+    "checkout", "payments", "search", "auth", "inventory",
+})
+
+
+def _root_cause_supported_by_observational_evidence(root_cause: str, evidence_texts: list[str]) -> bool:
+    """Deterministic support check (Phase 5).
+
+    Returns True only when at least two distinctive words from the proposed
+    root cause appear (as substrings) in usable LOG or METRIC evidence from
+    this incident. Knowledge-base docs are deliberately excluded: a runbook
+    or postmortem describing a similar past incident is guidance, not
+    observation of this incident, so it can never directly support a root
+    cause on its own. With no log/metric evidence the answer is always
+    False — the guard then abstains rather than trusting the LLM.
+    """
+    if not root_cause or not evidence_texts:
+        return False
+    combined = " ".join(evidence_texts).lower()
+    tokens = re.findall(r"[a-z0-9]+", root_cause.lower())
+    kept = {t for t in tokens if len(t) >= 4 and t not in _GUARD_STOPWORDS}
+    hits = {t for t in kept if t in combined}
+    return len(hits) >= 2
 
 # Remediation templates keyed by the tool the evidence supports.
 PLAN_TEMPLATES = {
@@ -145,7 +178,17 @@ async def _groq_hypothesis(incident: Incident, scenario: dict, evidence_text: st
         result = await client.chat_json(
             system="You are a site reliability engineer investigating a production incident. "
             "Use ONLY the evidence provided. Every claim must cite evidence. "
-            "If evidence is insufficient, say so. Reply with JSON: "
+            "ABSTENTION RULES — follow these before proposing any root cause: "
+            "(1) If the evidence does not name a specific root cause for THIS incident, "
+            "abstain: set root_cause to \"\", confidence below 0.65, and tool to \"none\". "
+            "Abstaining rather than guessing is the correct answer when evidence is insufficient. "
+            "(2) Never invent deploy versions, service details, error messages, or root causes "
+            "that do not appear in the evidence. "
+            "(3) A runbook or postmortem describing a similar past incident is NOT evidence that "
+            "this incident has the same cause; only logs or metrics from THIS incident can support "
+            "a root cause. "
+            "(4) When abstaining, reply with root_cause \"\", confidence below 0.65, tool \"none\". "
+            "Reply with JSON: "
             '{"root_cause": str, "confidence": float 0-1, "tool": one of rollback_deploy|restart_service|scale_replicas|run_health_check|none, "reasoning": str}',
             user=f"Service: {incident.service}\nAlert: {incident.title}\nEvidence:\n{evidence_text}",
         )
@@ -395,6 +438,40 @@ async def run_investigation(db: Session, incident: Incident) -> dict:
             hyp = _deterministic_hypothesis(incident, scenario, lo, mo, kb_out["out"])
         _agent_run(db, incident.id, "supervisor", "demo", 0, 0.0, int((time.time() - started) * 1000))
 
+    # Phase 5 abstention guard — deterministic, live mode only, LLM path
+    # only. The LLM's own confidence is NOT trusted here: a confident
+    # hallucination (e.g. a 0.95 "memory leak" for an unknown-signal alert)
+    # must still abstain. The guard fires when usable evidence is only
+    # knowledge-base docs (no log or metric evidence from this incident),
+    # or when the scenario has no known root cause (unknown-signal, or an
+    # ad-hoc alert with no scenario). It is lifted only when the proposed
+    # root cause is directly supported by usable log/metric evidence —
+    # see _root_cause_supported_by_observational_evidence. When it fires,
+    # confidence is capped below the 0.65 threshold and the hypothesis is
+    # forced to abstain. Demo mode and the deterministic fallback path are
+    # untouched (llm is None there, so this block is skipped).
+    if not demo_mode and llm and llm.get("root_cause") and not hyp.get("abstain"):
+        usable = [e for e in db.query(Evidence).filter_by(incident_id=incident.id).all()
+                  if e.id in set(usable_evidence_ids)]
+        usable_kinds = {e.kind for e in usable}
+        only_docs = bool(usable) and usable_kinds == {"doc"}
+        unknown_cause = incident.scenario not in SCENARIOS or not scenario.get("root_cause")
+        if only_docs or unknown_cause:
+            obs_texts = [e.content for e in usable if e.kind in ("log", "metric")]
+            proposed, proposed_conf = hyp.get("root_cause", ""), hyp.get("confidence", 0.0)
+            if not _root_cause_supported_by_observational_evidence(proposed, obs_texts):
+                reasons = []
+                if only_docs:
+                    reasons.append("usable evidence is only knowledge-base docs (no log or metric evidence from this incident)")
+                if unknown_cause:
+                    reasons.append("this scenario has no known root cause")
+                hyp = {**hyp, "root_cause": "", "tool": "none", "abstain": True,
+                       "confidence": min(proposed_conf, round(ABSTAIN_CONFIDENCE - 0.01, 2)),
+                       "reasoning": ("Phase 5 abstention guard: LLM proposed "
+                                     f"{proposed!r} at confidence {proposed_conf} but {'; '.join(reasons)} "
+                                     "and no log/metric evidence directly supports it. Abstaining rather than guessing."),
+                       "_guard": "phase5_abstention_guard"}
+
     # Enforce citation coverage: a hypothesis with no usable evidence, or
     # confidence below the threshold, is downgraded to abstain.
     if hyp.get("confidence", 0) < ABSTAIN_CONFIDENCE or not usable_evidence_ids or hyp.get("abstain"):
@@ -407,10 +484,11 @@ async def run_investigation(db: Session, incident: Incident) -> dict:
                           next_steps=[f"Manual triage required for {incident.service}: check live logs and metrics; no automated remediation proposed."]))
         db.commit()
         _event(db, incident.id, "hypothesis", "supervisor", {"message": "Abstained — insufficient evidence", "confidence": hyp.get("confidence", 0.0),
+                                                             "abstention_guard": hyp.get("_guard"),
                                                              "integrations": integrations})
         return {"incident_id": incident.id, "status": "abstained", "demo_mode": demo_mode,
                 "integrations": integrations, "hypotheses": [], "tokens": tokens, "cost_usd": cost,
-                "groq_error": groq_error}
+                "groq_error": groq_error, "abstention_guard": hyp.get("_guard")}
 
     # Remediation plan — only from the allow-listed tool the evidence supports.
     tool = hyp.get("tool") or "none"
