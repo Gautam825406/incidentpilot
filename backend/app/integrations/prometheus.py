@@ -9,6 +9,13 @@ Auth: an optional Bearer token from settings (PROMETHEUS_AUTH_TOKEN). The
 token is only ever sent in the Authorization header — it is never logged,
 never included in an error message, and never returned by any API.
 
+Phase 8 — Grafana Cloud Prometheus requires HTTP Basic auth instead:
+username = the Prometheus instance ID, password = the API token. When a
+username is configured (PROMETHEUS_USERNAME globally, or the per-org
+``username`` config field), the client sends ``Basic base64(user:token)``;
+without a username it keeps the Bearer behaviour for self-hosted
+Prometheus.
+
 PromQL notes (standard selectors on the `service` label; keep queries simple
 and documented — if a metric name does not exist in the target Prometheus,
 the query returns an empty result and is handled gracefully):
@@ -19,6 +26,7 @@ the query returns an empty result and is handled gracefully):
 - Availability: the `up` scrape-health metric for the service, as a %
 """
 import asyncio
+import base64
 import math
 
 import httpx
@@ -37,17 +45,27 @@ def _escape_label(value: str) -> str:
 
 class PrometheusClient:
     def __init__(self, base_url: str | None = None, auth_token: str | None = None,
-                 timeout: float | None = None, transport: httpx.BaseTransport | None = None):
+                 timeout: float | None = None, transport: httpx.BaseTransport | None = None,
+                 username: str | None = None):
         self.base_url = (base_url if base_url is not None else settings.prometheus_url).rstrip("/")
         self._auth_token = auth_token if auth_token is not None else settings.prometheus_auth_token
+        self._username = (username if username is not None else settings.prometheus_username or "").strip()
         self.timeout = float(timeout if timeout is not None else settings.prometheus_timeout)
         self._transport = transport
 
     def _headers(self) -> dict:
         # Token only ever goes into the header; never logged or echoed.
-        if self._auth_token and self._auth_token.strip():
-            return {"Authorization": f"Bearer {self._auth_token}"}
-        return {}
+        # Grafana Cloud Prometheus requires HTTP Basic auth (username =
+        # instance ID, token = password) — a Bearer token there is a 401.
+        # With a username configured, send Basic auth; without one, keep
+        # the existing Bearer behaviour for self-hosted Prometheus.
+        token = (self._auth_token or "").strip()
+        if not token:
+            return {}
+        if self._username:
+            raw = base64.b64encode(f"{self._username}:{token}".encode("utf-8")).decode("ascii")
+            return {"Authorization": f"Basic {raw}"}
+        return {"Authorization": f"Bearer {token}"}
 
     async def _get(self, path: str, params: dict | None = None) -> httpx.Response:
         # trust_env=False: ignore proxy env vars. Prometheus is an internal
@@ -317,8 +335,12 @@ def get_prometheus_client_for_org(db, org_id: str | None,
             secrets = integ.get("secrets") or {}
             url = (config.get("url") or config.get("base_url") or "").strip()
             token = (secrets.get("token") or secrets.get("api_key") or "").strip()
+            # Phase 8 — Grafana Cloud needs HTTP Basic auth: the instance
+            # ID is a plain (non-secret) config field "username".
+            username = (config.get("username") or "").strip()
             if url:
                 return PrometheusClient(base_url=url, auth_token=token or None,
+                                        username=username or None,
                                         transport=transport)
     client = get_prometheus_client()
     if transport is not None and isinstance(client, PrometheusClient):

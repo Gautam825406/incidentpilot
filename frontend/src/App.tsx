@@ -211,6 +211,7 @@ export type StatusEntry = {
 /**
  * Normalise GET /api/integrations/status into one entry per integration.
  * Accepts the Phase 7 per-org shape (an array, or {integrations: [...]},
+ * or {org_integrations: [...]} as returned by GET /api/integrations/status,
  * each entry {name, configured, provider, masked_url, last_test_ok,
  * source: "org"|"global"|"none"}) AND the pre-Phase-7 global map shape
  * ({prometheus: {configured, reachable, url, provider}, logs: {provider,
@@ -229,7 +230,9 @@ function normalizeStatus(raw: unknown, orgConfigured: Set<string>): Record<Integ
     ? (raw as Any[])
     : Array.isArray((raw as Any).integrations)
       ? ((raw as Any).integrations as Any[])
-      : [];
+      : Array.isArray((raw as Any).org_integrations)
+        ? ((raw as Any).org_integrations as Any[])
+        : [];
   if (list.length > 0) {
     for (const e of list) {
       const name = String(e.name ?? "");
@@ -293,9 +296,12 @@ const INTEGRATION_META: Record<
 > = {
   prometheus: {
     label: "Prometheus",
-    blurb: "Metrics source the investigation agents read.",
-    configFields: [{ key: "url", label: "Prometheus URL", placeholder: "http://localhost:9090" }],
-    secretFields: [{ key: "token", label: "Bearer token" }],
+    blurb: "Metrics source the investigation agents read. Grafana Cloud uses HTTP Basic auth: put the instance ID in Username and the API token in the token field — a Bearer token alone gets a 401.",
+    configFields: [
+      { key: "url", label: "Prometheus URL", placeholder: "http://localhost:9090" },
+      { key: "username", label: "Username / Instance ID", placeholder: "e.g. 3757974 (Grafana Cloud instance ID)" },
+    ],
+    secretFields: [{ key: "token", label: "API token" }],
   },
   logs: {
     label: "Logs",

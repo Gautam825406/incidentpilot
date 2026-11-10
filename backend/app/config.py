@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     # Phase 2 — Prometheus (optional; empty = not configured, demo mode unaffected)
     prometheus_url: str = ""
     prometheus_auth_token: str = ""
+    # Phase 8 — Grafana Cloud Prometheus uses HTTP Basic auth: the
+    # instance ID is the username and the API token is the password.
+    # Empty = Bearer-token auth (self-hosted Prometheus) as before.
+    prometheus_username: str = ""
     prometheus_timeout: float = 10.0
     # Grafana (optional; dashboards is a JSON object mapping service -> dashboard path/UID)
     grafana_url: str = ""
