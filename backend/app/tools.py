@@ -63,15 +63,22 @@ def get_error_clusters(inp: SearchLogsInput, scenario: dict) -> dict:
 def get_metrics(inp: MetricsInput, scenario: dict) -> dict:
     m = scenario.get("metrics", {})
     baseline = SERVICE_STATE.get(inp.service, {})
+    # Prefer the explicit baseline keys a simulation stored; the plain
+    # error_rate/latency_ms keys in SERVICE_STATE are the LIVE signal
+    # (spike value after /api/simulate), not the baseline.
+    er_base = m.get("error_rate_baseline",
+                    baseline.get("error_rate_baseline", baseline.get("error_rate", 0.4)))
+    lat_base = m.get("latency_baseline",
+                     baseline.get("latency_baseline", baseline.get("latency_ms")))
     return {
         "tool": "get_metrics",
         "service": inp.service,
         "error_rate": m.get("error_rate"),
-        "error_rate_baseline": m.get("error_rate_baseline", baseline.get("error_rate")),
+        "error_rate_baseline": er_base,
         "latency_ms": m.get("latency_ms"),
-        "latency_baseline": m.get("latency_baseline", baseline.get("latency_ms")),
+        "latency_baseline": lat_base,
         "cpu": m.get("cpu"),
-        "anomaly": (m.get("error_rate", 0) or 0) > 5 * (m.get("error_rate_baseline", 0.4) or 0.4),
+        "anomaly": (m.get("error_rate", 0) or 0) > 5 * (er_base or 0.4),
     }
 
 

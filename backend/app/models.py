@@ -131,7 +131,13 @@ class AgentRun(Base):
     agent = Column(String, nullable=False)
     prompt_version = Column(String, default="v1")
     model = Column(String, default="demo")
-    tokens = Column(Integer, default=0)
+    # NULL = the agent ran no LLM call (deterministic specialist agents).
+    # 0 = an LLM call genuinely used 0 tokens (demo-mode supervisor).
+    # No default: SQLAlchemy would apply a default=0 over an explicit
+    # None on INSERT, which would erase the NULL-vs-0 distinction.
+    # The column was already nullable, so this is a Python-side change
+    # only — no DB migration.
+    tokens = Column(Integer, nullable=True)
     cost_usd = Column(Float, default=0.0)
     latency_ms = Column(Integer, default=0)
     status = Column(String, default="done")

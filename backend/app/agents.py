@@ -333,7 +333,11 @@ def _event(db: Session, incident_id: str, type_: str, actor: str, payload: dict)
     db.commit()
 
 
-def _agent_run(db: Session, incident_id: str, agent: str, model: str, tokens: int, cost: float, latency_ms: int):
+def _agent_run(db: Session, incident_id: str, agent: str, model: str, tokens: int | None, cost: float, latency_ms: int):
+    # tokens is None when the agent ran no LLM call (deterministic
+    # specialist agents) — NULL in the DB, rendered as "—" in the UI.
+    # It is 0 only when an LLM call genuinely used 0 tokens (e.g. the
+    # demo-mode supervisor), which must stay distinguishable from NULL.
     db.add(AgentRun(incident_id=incident_id, agent=agent, prompt_version=PROMPT_VERSION, model=model, tokens=tokens, cost_usd=cost, latency_ms=latency_ms))
     db.commit()
 
@@ -402,6 +406,24 @@ def _deterministic_hypothesis(incident: Incident, scenario: dict, logs_out: dict
             "tool": scenario.get("remediation_tool") or "none", "abstain": False,
             "reasoning": f"Error rate {metrics_out.get('error_rate')}% vs baseline {metrics_out.get('error_rate_baseline')}%, "
             f"{logs_out.get('count')} matching log lines, and a matching runbook/postmortem were found."}
+
+
+def _baseline_for(service: str) -> dict:
+    """Healthy baseline for a service, as {"error_rate": float|None,
+    "latency_ms": float|None}.
+
+    A simulation stores the pre-spike value under explicit *_baseline
+    keys in SERVICE_STATE; the plain error_rate / latency_ms keys are
+    the LIVE signal (spike value after /api/simulate, verification
+    value after an executor run) and must never be read as the baseline.
+    Before any simulation the state's initial values ARE the healthy
+    baseline, so they are the fallback.
+    """
+    state = SERVICE_STATE.get(service, {}) or {}
+    return {
+        "error_rate": state.get("error_rate_baseline", state.get("error_rate")),
+        "latency_ms": state.get("latency_baseline", state.get("latency_ms")),
+    }
 
 
 async def run_investigation(db: Session, incident: Incident) -> dict:
@@ -493,6 +515,13 @@ async def run_investigation(db: Session, incident: Incident) -> dict:
     async def metrics_agent():
         t0 = time.time()
         prom_configured = integrations["prometheus"]["configured"]
+        # Healthy baseline for this service. A simulation stores the
+        # pre-spike value under explicit *_baseline keys; the plain
+        # error_rate/latency_ms keys are the LIVE signal (spike value
+        # after /api/simulate) and must never be read as the baseline.
+        # Before any simulation the state's initial values ARE the
+        # healthy baseline, so they are the fallback.
+        baseline = _baseline_for(incident.service)
         if not demo_mode:
             # run_id scopes the embedded provider to this incident's run
             # (see logs_agent above); external Prometheus ignores it.
@@ -505,11 +534,10 @@ async def run_investigation(db: Session, incident: Incident) -> dict:
                 if "unexpected keyword argument" not in str(exc):
                     raise
                 real = await _fetch_real_metrics(incident.service, run_id=incident.external_id)
-            baseline = SERVICE_STATE.get(incident.service, {})
             if real is None:
                 out = {"tool": "get_metrics", "service": incident.service,
-                       "error_rate": None, "error_rate_baseline": baseline.get("error_rate"),
-                       "latency_ms": None, "latency_baseline": baseline.get("latency_ms"),
+                       "error_rate": None, "error_rate_baseline": baseline["error_rate"],
+                       "latency_ms": None, "latency_baseline": baseline["latency_ms"],
                        "cpu": None, "anomaly": False, "source": "real",
                        "configured": False, "metrics": {}}
                 return {"agent": "metrics", "out": out, "latency_ms": int((time.time() - t0) * 1000)}
@@ -517,10 +545,10 @@ async def run_investigation(db: Session, incident: Incident) -> dict:
             er_val = er.get("value") if er.get("available") else None
             lat_val = lat.get("value") if lat.get("available") else None
             cpu_val = cpu.get("value") if cpu.get("available") else None
-            er_base = baseline.get("error_rate")
+            er_base = baseline["error_rate"]
             out = {"tool": "get_metrics", "service": incident.service,
                    "error_rate": er_val, "error_rate_baseline": er_base,
-                   "latency_ms": lat_val, "latency_baseline": baseline.get("latency_ms"),
+                   "latency_ms": lat_val, "latency_baseline": baseline["latency_ms"],
                    "cpu": cpu_val,
                    "anomaly": bool(er_val is not None and er_base is not None and er_val > 5 * er_base),
                    "source": "real", "configured": True, "metrics": real}
@@ -579,17 +607,17 @@ async def run_investigation(db: Session, incident: Incident) -> dict:
                           f"Prometheus is not configured (prometheus_url unset) — no real metrics collected for {incident.service}.",
                           usable=False)
         else:
-            baseline = SERVICE_STATE.get(incident.service, {})
+            baseline = _baseline_for(incident.service)
             for name, label in [("error_rate", "error_rate"), ("latency", "latency"), ("cpu", "cpu"),
                                 ("memory", "memory"), ("availability", "availability")]:
                 m = (mo.get("metrics") or {}).get(name) or {}
                 if m.get("available"):
                     value, unit, query = m.get("value"), m.get("unit", ""), m.get("query", "")
                     content = f"{label} {value}{unit}"
-                    if name == "error_rate" and baseline.get("error_rate") is not None:
+                    if name == "error_rate" and baseline["error_rate"] is not None:
                         content += (f" (baseline {baseline['error_rate']}%, "
                                     f"{'above baseline' if value > baseline['error_rate'] else 'at or below baseline'})")
-                    if name == "latency" and baseline.get("latency_ms") is not None:
+                    if name == "latency" and baseline["latency_ms"] is not None:
                         content += (f" (baseline {baseline['latency_ms']}ms, "
                                     f"{'above baseline' if value > baseline['latency_ms'] else 'at or below baseline'})")
                     if query:
@@ -611,7 +639,7 @@ async def run_investigation(db: Session, incident: Incident) -> dict:
         _add_evidence("doc", doc["title"], doc["content"][:600])
 
     for name, out in [("triage", triage_out), ("logs", logs_res), ("metrics", metrics_res), ("knowledge", kb_out)]:
-        _agent_run(db, incident.id, name, "demo" if demo_mode else settings.groq_model, 0, 0.0, out.get("latency_ms", 0))
+        _agent_run(db, incident.id, name, "demo" if demo_mode else settings.groq_model, None, 0.0, out.get("latency_ms", 0))
         payload = {"message": f"{name} agent finished", "out": str(out)[:500]}
         if name == "triage":
             payload.update({"service": incident.service, "severity": incident.severity,

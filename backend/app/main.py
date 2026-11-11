@@ -328,7 +328,7 @@ def _detail(db: Session, incident: Incident) -> dict:
         "plan": {"id": plan.id, "steps": plan.steps, "risk": plan.risk, "rollback": plan.rollback, "status": plan.status,
                  "approved_by": plan.approved_by, "expires_at": plan.expires_at.isoformat() if plan.expires_at else None} if plan else None,
         "agent_runs": [{"agent": r.agent, "model": r.model, "tokens": r.tokens, "cost_usd": r.cost_usd, "latency_ms": r.latency_ms} for r in runs],
-        "total_tokens": sum(r.tokens for r in runs),
+        "total_tokens": sum(r.tokens or 0 for r in runs),
         "total_cost_usd": round(sum(r.cost_usd for r in runs), 6),
         "postmortem": postmortem_draft(incident, hyps, plan) if incident.status in ("resolved", "verifying", "approved", "awaiting_approval") and hyps else None,
     }
@@ -923,7 +923,18 @@ async def simulate(body: SimulateIn, request: Request, db: Session = Depends(get
     inc = Incident(title=sc["title"], service=sc["service"], severity=sc["severity"], source="simulator",
                    external_id=f"sim-{uuid.uuid4().hex[:8]}", scenario=body.scenario, org_id=org_id)
     db.add(inc); db.commit(); db.refresh(inc)
-    SERVICE_STATE.setdefault(sc["service"], {})["error_rate"] = sc["metrics"]["error_rate"]
+    # The spike value is the LIVE signal (the executor's verification
+    # reads SERVICE_STATE["error_rate"]). The pre-spike healthy value is
+    # the BASELINE and lives in a separate key — overwriting error_rate
+    # used to make the metrics agent report "(baseline 18.7%)" and the
+    # anomaly check fail on a real spike (true baseline: 0.4%).
+    _state = SERVICE_STATE.setdefault(sc["service"], {})
+    _prev_rate = _state.get("error_rate")
+    _state["error_rate"] = sc["metrics"]["error_rate"]
+    _state["error_rate_baseline"] = sc["metrics"].get(
+        "error_rate_baseline", _state.get("error_rate_baseline", _prev_rate))
+    _state["latency_baseline"] = sc["metrics"].get(
+        "latency_baseline", _state.get("latency_baseline", _state.get("latency_ms")))
     _event(db, inc.id, "alert", "simulator", {"title": sc["title"], "scenario": body.scenario})
     # Phase 6 — emit the simulated service's telemetry BEFORE the
     # investigation runs, tagged with this incident's external_id (the

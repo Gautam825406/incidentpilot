@@ -1532,7 +1532,7 @@ export default function App() {
                     ) : (
                       <div className="table-scroll">
                         <table className="mini-table"><thead><tr><th>Agent</th><th>Model</th><th>Tokens</th><th>Latency</th><th>Cost</th></tr></thead><tbody>
-                          {(selected.agent_runs as Any[]).map((r, i) => <tr key={i}><td>{r.agent as string}</td><td>{r.model as string}</td><td>{r.tokens as number}</td><td>{r.latency_ms as number} ms</td><td>${(r.cost_usd as number) ?? 0}</td></tr>)}
+                          {(selected.agent_runs as Any[]).map((r, i) => <tr key={i}><td>{r.agent as string}</td><td>{r.model as string}</td><td>{r.tokens == null ? "—" : (r.tokens as number)}</td><td>{r.latency_ms as number} ms</td><td>${(r.cost_usd as number) ?? 0}</td></tr>)}
                         </tbody></table>
                       </div>
                     )}
