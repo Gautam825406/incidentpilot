@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 
 from .agents import build_graph, run_investigation
 from .config import settings, validate_production_settings
-from .crypto import mask_secret
+from .crypto import mask_secret, validate_credentials_key
 from .database import SessionLocal, get_db, init_db
 from .executor import execute_plan, postmortem_draft, verify_recovery
 from .integrations.grafana import dashboard_url, grafana_status
@@ -59,6 +59,11 @@ logger = logging.getLogger(__name__)
 # secret. Env-driven and import-time on purpose: production settings come
 # from the environment, fixed before the app starts (see config.py).
 validate_production_settings(settings)
+
+# Same idea for the per-org credential encryption key: without a
+# persistent CREDENTIALS_ENCRYPTION_KEY a production deploy silently
+# loses every saved integration secret on restart (see app/crypto.py).
+validate_credentials_key()
 
 
 @asynccontextmanager
@@ -329,10 +334,31 @@ def _detail(db: Session, incident: Incident) -> dict:
     }
 
 
-@app.get("/api/health")
-def health():
+def _health_payload():
     return {"status": "ok", "demo_mode": settings.demo_mode, "model": "demo" if settings.demo_mode else settings.groq_model,
             "langgraph": _graph is not None}
+
+
+@app.get("/api/health")
+def health():
+    return _health_payload()
+
+
+@app.get("/", include_in_schema=False)
+def root():
+    """Root alias — Render / uptime checks often hit `/` first.
+
+    Previously `/` (and `/health`) returned 404 while only `/api/health`
+    worked, so a plain health check of the backend URL looked down.
+    Returns the same payload as /api/health.
+    """
+    return _health_payload()
+
+
+@app.get("/health", include_in_schema=False)
+def health_alias():
+    """`/health` alias for the same payload as `/api/health`."""
+    return _health_payload()
 
 
 @app.get("/metrics")

@@ -82,7 +82,10 @@ class Settings(BaseSettings):
     # Phase 7 — per-org credential encryption (see app/crypto.py).
     # Base64 urlsafe 32-byte Fernet key. Empty = an ephemeral key is
     # generated at startup (demo only; credentials encrypted with it do
-    # not survive a restart). Set CREDENTIALS_ENCRYPTION_KEY in production.
+    # not survive a restart). A production deployment (live LLM mode or
+    # Postgres DATABASE_URL) REFUSES to start without a persistent key —
+    # see validate_credentials_key() in app/crypto.py. Set
+    # CREDENTIALS_ENCRYPTION_KEY in production (Render env var).
     credentials_encryption_key: str = ""
     # Phase 8 — optional shared secret for /api/webhooks/alert. Empty
     # (default) keeps the demo behaviour: the webhook is open. When set,

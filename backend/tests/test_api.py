@@ -18,6 +18,17 @@ def test_health_demo_mode():
     assert r.json()["demo_mode"] is True
 
 
+def test_root_and_health_aliases_match_api_health():
+    # Regression: `/` and `/health` used to 404 while only `/api/health`
+    # worked, so a plain check of the backend URL looked down.
+    api = client.get("/api/health")
+    assert api.status_code == 200
+    for path in ("/", "/health"):
+        r = client.get(path)
+        assert r.status_code == 200, path
+        assert r.json() == api.json()
+
+
 def test_simulate_end_to_end_to_approval():
     r = client.post("/api/simulate", json={"scenario": "checkout-oom"})
     assert r.status_code == 200, r.text

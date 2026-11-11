@@ -1,7 +1,11 @@
 type Any = Record<string, unknown>;
 
 export default function Landing({ health, onEnter, onSignup }: { health: Any | null; onEnter: () => void; onSignup: () => void }) {
-  const demo = health ? Boolean(health.demo_mode) : true;
+  // While the backend health check is still loading (health === null),
+  // don't claim demo mode — that misled the landing page into saying
+  // "demo mode" even when the live backend was in live-LLM mode.
+  const loading = health === null;
+  const demo = health ? Boolean(health.demo_mode) : false;
   return (
     <div className="landing">
       <header className="landing-nav">
@@ -34,7 +38,9 @@ export default function Landing({ health, onEnter, onSignup }: { health: Any | n
             <a className="ghost-btn" href="https://github.com/Gautam825406/incidentpilot" target="_blank" rel="noreferrer">View on GitHub</a>
           </div>
           <p className="muted">
-            {demo
+            {loading
+              ? "Checking live status…"
+              : demo
               ? "Running in demo mode — add a GROQ_API_KEY for live LLM. Simulated services only, no real production action is ever taken."
               : `Live LLM: ${String(health?.model ?? "")} — simulated services only.`}
           </p>
