@@ -21,7 +21,7 @@ function severityBadge(s: string) {
   return <span className={`badge ${cls}`}>{s}</span>;
 }
 
-type LiveMetrics = { errorRate?: string; cpu?: string; memory?: string; latency?: string };
+type LiveMetrics = { errorRate?: string; cpu?: string; memory?: string; latency?: string; demo?: boolean };
 
 /** Extract error_rate / cpu / memory / latency from one metric-evidence content string.
  *  Handles the backend's plain-text form ("error_rate 18.7% (baseline 0.8%), latency
@@ -54,12 +54,18 @@ function parseMetricContent(content: string): LiveMetrics {
 }
 
 /** Merge metric evidence (kind === "metric") from an incident detail into one
- *  LiveMetrics record. Fields with no real evidence stay absent ("—" in the UI). */
+ *  LiveMetrics record. Fields with no real evidence stay absent ("—" in the UI).
+ *  `demo` is set when any metric came from the labelled demo/simulated source
+ *  (Prometheus had no series for the service) — those values are simulated,
+ *  never production data. */
 function metricsFromEvidence(evidence: Any[]): LiveMetrics {
   const merged: LiveMetrics = {};
   for (const e of evidence ?? []) {
     if (e.kind !== "metric") continue;
-    const p = parseMetricContent(String(e.content ?? ""));
+    const src = String(e.source_ref ?? "");
+    const content = String(e.content ?? "");
+    if (src.includes("demo-simulated") || content.includes("demo/simulated")) merged.demo = true;
+    const p = parseMetricContent(content);
     if (p.errorRate && !merged.errorRate) merged.errorRate = p.errorRate;
     if (p.cpu && !merged.cpu) merged.cpu = p.cpu;
     if (p.memory && !merged.memory) merged.memory = p.memory;
@@ -1352,7 +1358,7 @@ export default function App() {
             </div>
             <div className="card">
               <h2>Live Incident Dashboard</h2>
-              <p className="muted">Active incidents and the live metrics the investigation actually observed. Values come only from metric evidence — “—” / “No live metrics” means no metric was recorded, never an invented number.</p>
+              <p className="muted">Active incidents and the live metrics the investigation actually observed. Values come only from metric evidence — “—” / “No live metrics” means no metric was recorded, never an invented number. Values marked “demo data” are simulated (Prometheus has no series for that service), not production metrics.</p>
               {(() => {
                 const active = incidents.filter((i) => (i.status as string) !== "resolved");
                 if (active.length === 0) return <p className="muted">No active incidents — everything is resolved.</p>;
@@ -1372,7 +1378,7 @@ export default function App() {
                             const noMetrics = !m.errorRate && !m.cpu && !m.memory && !m.latency;
                             return (
                               <tr key={i.id as string}>
-                                <td><button onClick={() => open(i.id as string)}>{i.title as string}</button>{noMetrics && <div className="muted">No live metrics</div>}</td>
+                                <td><button onClick={() => open(i.id as string)}>{i.title as string}</button>{m.demo && !noMetrics && <div><span className="badge amber" title="Simulated metrics — Prometheus has no series for this service, so the values come from the simulated services' own telemetry, not production data.">demo data</span></div>}{noMetrics && <div className="muted">No live metrics</div>}</td>
                                 <td>{i.service as string}</td>
                                 <td>{severityBadge(i.severity as string)}</td>
                                 <td>{statusBadge(i.status as string)}</td>
@@ -1421,7 +1427,7 @@ export default function App() {
                           </div>
                           {mon && (
                             <div className="muted" style={{ marginTop: 4 }}>
-                              Prometheus: {mon.prometheus_configured ? "configured" : "not connected"} · Logs provider: {typeof mon.logs_provider === "string" && mon.logs_provider ? (mon.logs_provider as string) : "not connected"}
+                              Prometheus: {mon.prometheus_configured ? "configured" : "not connected"}{mon.prometheus_configured && typeof mon.prometheus_last_test_ok === "boolean" ? (mon.prometheus_last_test_ok ? " · last test passed" : " · last test failed") : ""} · Logs provider: {typeof mon.logs_provider === "string" && mon.logs_provider ? (mon.logs_provider as string) : "not connected"}
                             </div>
                           )}
                           <div className="muted" style={{ marginTop: 4 }}>Dashboard links are links only — Grafana does not supply the metrics shown in this console.</div>

@@ -293,10 +293,20 @@ def _detail(db: Session, incident: Incident) -> dict:
     plan = plans[0] if plans else None
     # Monitoring links/config for this incident's service. Guarded so a
     # failing integration helper can never break the detail response.
+    # Prometheus configured-ness honours the incident's workspace (org)
+    # integration, not just the global env URL — a workspace whose test
+    # passed must not render as "not connected" here. last_test_ok is
+    # the workspace integration's last connectivity-test outcome (True /
+    # False / None when never tested).
     try:
+        _org_id = incident.org_id or get_or_create_demo_org(db).id
+        _prom_entry = next((e for e in org_integration_status(db, _org_id)
+                            if e.get("name") == "prometheus"), None)
         monitoring = {
             "grafana_dashboard_url": dashboard_url(incident.service),
-            "prometheus_configured": bool((settings.prometheus_url or "").strip()),
+            "prometheus_configured": bool((settings.prometheus_url or "").strip())
+                or bool(_prom_entry and _prom_entry.get("configured")),
+            "prometheus_last_test_ok": _prom_entry.get("last_test_ok") if _prom_entry else None,
             "logs_provider": get_log_provider().provider_name,
         }
     except Exception:

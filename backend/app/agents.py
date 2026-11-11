@@ -33,7 +33,8 @@ from .integrations.grafana import dashboard_url, dashboard_url_for_org
 from .integrations.logs import (get_log_provider, get_log_provider_for_org,
                                group_exceptions, search_logs_real,
                                search_logs_real_for_org)
-from .integrations.prometheus import get_prometheus_client, get_prometheus_client_for_org
+from .integrations.prometheus import (EmbeddedPrometheusClient, PrometheusClient,
+                                     get_prometheus_client, get_prometheus_client_for_org)
 from .llm import GroqClient
 from .models import AgentRun, Evidence, Hypothesis, Incident, IncidentEvent, RemediationPlan
 from .security import sanitise_evidence
@@ -235,6 +236,42 @@ async def _fetch_real_logs(service: str, created_at, run_id: str | None = None,
             "groups": groups, "error": error}
 
 
+_PROMETHEUS_NO_DATA_ERROR = "no data returned for this metric"
+
+
+async def _demo_simulated_metrics(service: str, run_id: str | None) -> dict | None:
+    """Demo/simulated metrics for a simulated service, from the telemetry
+    the simulated services emitted for this run.
+
+    Returns a per-metric dict in the same shape as
+    ``PrometheusClient.service_metrics`` with ``source`` "demo-simulated",
+    or None when the service is not a known simulated service, there is
+    no run id to scope to, or the telemetry store has no data for the
+    run. Values are MEASURED from the simulation (request observations
+    the simulator emitted), never invented — memory is not measured by
+    the simulator, so it stays unavailable.
+    """
+    if run_id is None or service not in SERVICE_STATE:
+        return None
+    embedded = EmbeddedPrometheusClient()
+    metrics = await embedded.service_metrics(service, run_id=run_id)
+    if not any((m or {}).get("available") for m in metrics.values()):
+        return None
+    out: dict = {}
+    for name, m in metrics.items():
+        m = m or {}
+        if m.get("available"):
+            out[name] = {"available": True, "value": m["value"], "unit": m.get("unit", ""),
+                         "query": f"demo-simulated: {name} from simulated-service telemetry",
+                         "source": "demo-simulated", "error": None}
+        else:
+            out[name] = {"available": False, "value": None, "unit": m.get("unit", ""),
+                         "query": f"demo-simulated: {name} from simulated-service telemetry",
+                         "source": "demo-simulated",
+                         "error": "not measured by the simulated services"}
+    return out
+
+
 async def _fetch_real_metrics(service: str, run_id: str | None = None,
                             db: Session | None = None, org_id: str | None = None) -> dict | None:
     """Query Prometheus for all five service metrics.
@@ -245,6 +282,12 @@ async def _fetch_real_metrics(service: str, run_id: str | None = None,
     ``run_id`` scopes the embedded provider to one simulation run (the
     incident's external_id); the external Prometheus client ignores it
     and queries by time window.
+
+    Demo/simulated fallback: when the external Prometheus answers but
+    has no series for a simulated service, per-metric gaps fall back to
+    the simulated services' telemetry for this run (source
+    "demo-simulated"); a Prometheus connection/auth failure is never
+    masked by the fallback.
 
     Phase 7: with ``db`` given, the org's Prometheus client is used
     (per-org credentials, else the global client); without ``db`` the
@@ -257,12 +300,32 @@ async def _fetch_real_metrics(service: str, run_id: str | None = None,
     if client is None:
         return None
     try:
-        return await client.service_metrics(service, run_id=run_id)
+        result = await client.service_metrics(service, run_id=run_id)
     except Exception:
         return {name: {"available": False, "value": None, "unit": unit, "query": "",
                        "source": "prometheus", "error": "Prometheus query failed"}
                 for name, unit in [("cpu", "%"), ("memory", "bytes"), ("error_rate", "%"),
                                    ("latency", "ms"), ("availability", "%")]}
+    # Demo/simulated fallback: the configured Prometheus answered but has
+    # no series for this service (e.g. a Grafana Cloud stack nothing ever
+    # ingested into). Per-metric, fall back to the telemetry the simulated
+    # services emitted for this run, labelled "demo-simulated" — never
+    # presented as production data. Only "no data" gaps fall back; a
+    # connection/auth failure keeps its error and is never masked.
+    if isinstance(client, PrometheusClient):
+        demo = await _demo_simulated_metrics(service, run_id)
+        if demo is not None:
+            merged: dict = {}
+            for name, m in result.items():
+                if (m or {}).get("available"):
+                    merged[name] = m
+                elif (m or {}).get("error") == _PROMETHEUS_NO_DATA_ERROR \
+                        and (demo.get(name) or {}).get("available"):
+                    merged[name] = demo[name]
+                else:
+                    merged[name] = m
+            result = merged
+    return result
 
 
 def _event(db: Session, incident_id: str, type_: str, actor: str, payload: dict):
@@ -353,8 +416,13 @@ async def run_investigation(db: Session, incident: Incident) -> dict:
     - Metrics: Prometheus configured -> service_metrics(), per-metric evidence
       (kind "metric", source "prometheus", value+unit+query, baseline note);
       a metric that is unavailable -> "integration_unavailable" for that
-      metric, no invented value. Not configured -> synthetic metrics only in
-      demo mode (labelled demo); in real mode an "integration_unavailable" item.
+      metric, no invented value. When the configured Prometheus answers
+      but has no series for a simulated service, the per-metric gap falls
+      back to the simulated services' own telemetry for that run, labelled
+      demo-simulated (never presented as production data); a Prometheus
+      connection/auth failure is never masked. Not configured -> synthetic
+      metrics only in demo mode (labelled demo); in real mode an
+      "integration_unavailable" item.
     - Knowledge: unchanged hybrid RAG (search_knowledge).
     A hypothesis is only proposed when usable evidence (everything except
     "integration_unavailable" items) exists and confidence >= 0.65.
@@ -526,7 +594,10 @@ async def run_investigation(db: Session, incident: Incident) -> dict:
                                     f"{'above baseline' if value > baseline['latency_ms'] else 'at or below baseline'})")
                     if query:
                         content += f" — query: {query}"
-                    _add_evidence("metric", "prometheus", content)
+                    is_demo = m.get("source") == "demo-simulated"
+                    if is_demo:
+                        content += " (demo/simulated data — Prometheus has no series for this service)"
+                    _add_evidence("metric", "demo-simulated" if is_demo else "prometheus", content)
                 else:
                     _add_evidence("integration_unavailable", "prometheus",
                                   f"Prometheus metric {label} unavailable for {incident.service}: "
